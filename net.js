@@ -38,7 +38,11 @@
                     // A two-byte range request tells us whether the file exists
                     // without ever downloading the segment.
                     const hit = (status) => status === 200 || status === 206;
-                    const definitive = (status) => hit(status) || status === 404 || status === 410;
+                    // 404/410 mean the file is gone, 401/403 mean the CDN will
+                    // not serve it at all: both are final answers. Only
+                    // throttling and server errors deserve a retry.
+                    const definitive = (status) => hit(status) ||
+                        status === 401 || status === 403 || status === 404 || status === 410;
                     const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
                     const probe = async (url) => {
                         let status = 0;
@@ -53,8 +57,6 @@
                                 });
                                 status = response.status;
                                 controller.abort();
-                                // 404/410 mean the original is gone for good; only
-                                // throttling and server errors deserve a retry.
                                 if (definitive(status)) return status;
                             } catch {
                                 controller.abort();

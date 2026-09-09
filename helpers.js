@@ -129,6 +129,9 @@
     // a transient answer must be retried, a definitive one must not.
     function classifyValidation(status, contentType) {
         if (status === 404 || status === 410) return { valid: false, definitive: true, status };
+        // The Twitch CDN answers 403 for objects it does not serve, so a
+        // forbidden reply is final as well: retrying it only burns requests.
+        if (status === 401 || status === 403) return { valid: false, definitive: true, forbidden: true, status };
         if (status === 429 || status >= 500) return { valid: false, transient: true, status };
         if (status !== 200 && status !== 206) return { valid: false, transient: true, status };
         const mime = String(contentType || '').toLowerCase();
