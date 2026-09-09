@@ -1,18 +1,14 @@
 // Twitch VOD Unmute — Modded
-// Playlist download and segment probing run inside the Twitch page, because the
-// CDN answers 403 to the same requests made from the extension origin.
-// Redirects are exact per-segment rules, like the original extension.
-if (typeof importScripts === 'function') importScripts('helpers.js');
+// Playlist download and segment probing run inside the Twitch page (see net.js),
+// because the CDN answers 403 to the same requests made from the extension
+// origin. Redirects are exact per-segment rules, like the original extension.
+if (typeof importScripts === 'function') importScripts('helpers.js', 'net.js', 'rules.js', 'seekbar.js');
 
 const QUALITIES = ['chunked', '1080p60', '1080p30', '720p60', '720p30', '480p30', '360p30', '160p30'];
 const PLAYLIST_PATTERN = /index-muted-[A-Z0-9]+\.m3u8/i;
 const SEGMENT_PATTERN = /\.(?:ts|mp4|m4s|aac)(?:\?|$)/i;
 const QUALITY_DIR_PATTERN = /^(?:chunked|audio_only|\d{3,4}p\d{2})$/;
 const BATCH_SIZE = 6;
-const MAX_RULES_PER_RENDITION = 4500;
-const RULE_RESERVE = 100;              // keep room for other tabs and extensions
-const DEFAULT_RULE_LIMIT = 5000;
-const MAX_RULE_ID = 2147480000;
 const PROBE_TTL_MS = 10 * 60 * 1000;
 const PROBE_CACHE_LIMIT = 20000;
 const HIT_STATUSES = new Set([200, 206]);
@@ -21,7 +17,7 @@ class VODUnmute {
     constructor() {
         this.tabs = new Map();            // tabId -> { vodBase, renditions: Map<quality, rendition> }
         this.epochs = new Map();          // tabId -> invalidation counter
-        this.activeQuality = new Map();   // tabId -> quality the player is actually requesting
+        this.activeQuality = new Map();   // tabId -> quality the player is really requesting
         this.knownPlaylists = new Map();  // tabId -> Set<playlistURL>
         this.paintData = new Map();       // tabId -> { ranges, totalDuration }
         this.probeCache = new Map();      // candidate URL -> { status, at }
@@ -67,13 +63,15 @@ class VODUnmute {
     }
 
     async onSettingsChanged(changes) {
+        // Turning the extension back on used to require a manual reload: the
+        // known playlists are re-checked instead.
         if (changes.enabled) {
             if (changes.enabled.newValue === true) await this.reprocessKnown();
             else await this.clearAll();
             return;
         }
-        // Switching the fallback on or off changes which candidates are valid,
-        // so the known playlists have to be checked again.
+        // The fallback switch changes which candidates are valid, so the known
+        // playlists have to be probed again.
         if (changes.quality) {
             await this.reprocessKnown();
             return;
@@ -107,16 +105,12 @@ class VODUnmute {
     epoch(tabId) { return this.epochs.get(tabId) || 0; }
     bump(tabId) { const value = this.epoch(tabId) + 1; this.epochs.set(tabId, value); return value; }
     serialize(task) { const result = this.mutations.then(task, task); this.mutations = result.catch(() => {}); return result; }
-    ruleLimit() {
-        const limit = chrome.declarativeNetRequest?.MAX_NUMBER_OF_SESSION_RULES;
-        return (Number.isInteger(limit) ? limit : DEFAULT_RULE_LIMIT) - RULE_RESERVE;
-    }
 
     statsFor(tabId) {
         const entry = this.tabs.get(tabId);
         if (!entry || !entry.renditions.size) return this.emptyStats();
-        // An in-progress check must stay visible: otherwise an already finished
-        // rendition hides the progress of the one the player is actually using.
+        // The rendition the player is using wins, then an in-progress check:
+        // otherwise a finished rendition hides the one being watched.
         const active = this.activeQuality.get(tabId);
         const rank = (rendition) => {
             if (rendition.quality === active && rendition.stats.state !== 'waiting') return 4;
@@ -157,15 +151,11 @@ class VODUnmute {
         if (!Number.isInteger(details.tabId) || details.tabId < 0) return;
         const file = details.url.split('/').at(-1) || '';
         if (PLAYLIST_PATTERN.test(file)) {
-            this.onPlaylist(details);
+            this.remember(details.tabId, details.url);
+            this.enqueue(details.tabId, details.url);
             return;
         }
         if (SEGMENT_PATTERN.test(file)) this.onSegmentRequest(details);
-    }
-
-    onPlaylist(details) {
-        this.remember(details.tabId, details.url);
-        this.enqueue(details.tabId, details.url);
     }
 
     enqueue(tabId, url) {
@@ -175,9 +165,10 @@ class VODUnmute {
         if (!this.working) this.drain().catch((error) => console.warn('[VOD Unmute] Queue failed:', error));
     }
 
+    // The rendition the player is really pulling is the one whose segments are
+    // being requested, so segment traffic is watched instead of guessing.
     onSegmentRequest(details) {
-        const parts = details.url.split('/');
-        const quality = parts.at(-2);
+        const quality = details.url.split('/').at(-2);
         if (!quality || !QUALITY_DIR_PATTERN.test(quality)) return;
         if (this.activeQuality.get(details.tabId) === quality) return;
         this.activeQuality.set(details.tabId, quality);
@@ -189,15 +180,14 @@ class VODUnmute {
     }
 
     requeueActive(tabId, quality) {
-        const entry = this.tabs.get(tabId);
-        const rendition = entry?.renditions.get(quality);
-        if (!entry || !rendition || rendition.ruleIds.length || rendition.playlistURL === undefined) return;
+        const rendition = this.tabs.get(tabId)?.renditions.get(quality);
+        if (!rendition || rendition.ruleIds.length || rendition.playlistURL === undefined) return;
         rendition.signature = null;
         this.enqueue(tabId, rendition.playlistURL);
     }
 
-    // Check the rendition the player is playing first: a background rendition
-    // must never delay the quality the user actually watches.
+    // Check the rendition being watched first: a background rendition must never
+    // delay the quality the user actually sees.
     sortQueue(tabId) {
         const active = this.activeQuality.get(tabId);
         if (!active) return;
@@ -231,6 +221,8 @@ class VODUnmute {
         }
     }
 
+    // --- processing ---------------------------------------------------------
+
     async process({ tabId, url, epoch }) {
         if ((await chrome.storage.sync.get('enabled')).enabled !== true) return;
         if (epoch !== this.epoch(tabId)) return;
@@ -260,11 +252,10 @@ class VODUnmute {
                 state: 'waiting',
                 message: `${quality} сейчас не воспроизводится (играет ${active}) — пропущено.`
             });
-            console.log(`[VOD Unmute] Skipping ${quality}: player is using ${active}.`);
             return;
         }
 
-        const text = await this.fetchInPage(tabId, url);
+        const text = await VODNet.fetchInPage(tabId, url);
         if (text === null) {
             console.warn('[VOD Unmute] Playlist download failed in page context:', url);
             return;
@@ -273,6 +264,8 @@ class VODUnmute {
 
         let playlist;
         try {
+            // Segment lines can be relative, `../`-relative or absolute, so they
+            // are resolved against the playlist URL instead of concatenated.
             playlist = VODHelpers.parseHlsPlaylist(text, url);
         } catch (error) {
             console.warn('[VOD Unmute] Not a valid M3U8 playlist:', error.message);
@@ -318,7 +311,6 @@ class VODUnmute {
             const attempts = batch.map((entry) => this.candidatesFor(entry, quality, perSegmentLower));
             const responses = await this.probe(tabId, attempts.map((list) => list.map((item) => item.url)));
             if (responses === null) {
-                console.warn(`[VOD Unmute] ${quality}: probing stopped, the tab is no longer scriptable.`);
                 this.setStats(tabId, vodBase, quality, {
                     state: 'unavailable',
                     message: `${quality}: проверка остановлена на ${checked}/${mutedMedia.length}; перезагрузите страницу.`
@@ -349,31 +341,8 @@ class VODUnmute {
             });
         }
 
-        // The init segment must be redirected too, otherwise the decoder is
-        // configured from muted audio and the unmuted media segments cannot play.
-        const initRedirects = [];
-        if (mutedMaps.length) {
-            const groups = mutedMaps.map((entry) => [VODHelpers.unmuteURL(entry.url)]);
-            const statuses = await this.probe(tabId, groups);
-            if (statuses === null || epoch !== this.epoch(tabId)) return;
-            mutedMaps.forEach((entry, index) => {
-                const status = statuses[index]?.[0];
-                if (VODHelpers.classifyValidation(status).valid) {
-                    initRedirects.push({ source: entry.url, url: groups[index][0], quality });
-                } else {
-                    console.warn(`[VOD Unmute] Muted init segment has no unmuted original (status=${status}); skipping redirects to avoid error #2000.`, entry.url);
-                }
-            });
-            if (initRedirects.length !== mutedMaps.length) {
-                this.setStats(tabId, vodBase, quality, {
-                    ...this.emptyStats(),
-                    muted: mutedMedia.length,
-                    state: 'unavailable',
-                    message: 'Init-сегмент заглушён, а оригинала нет — подмена сломала бы воспроизведение.'
-                });
-                return;
-            }
-        }
+        const initRedirects = await this.initRedirects(tabId, vodBase, quality, mutedMaps, mutedMedia.length, epoch);
+        if (initRedirects === null) return;
 
         const restored = results.filter((item) => item.url);
         const stats = {
@@ -385,26 +354,55 @@ class VODUnmute {
         };
 
         if (!restored.length) {
-            // The muted original is played by Twitch, so it must be reachable.
-            // If it is not, our probing method is at fault rather than the CDN.
-            const control = await this.probe(tabId, [[results[0].source]]);
-            const controlStatus = control?.[0]?.[0];
-            const codes = [...new Set(results.flatMap((item) => item.statuses))].join(', ') || 'нет';
-            console.warn(`[VOD Unmute] ${quality}: no unmuted files. statuses=${codes}, muted control=${controlStatus}.`,
-                'Sample:', VODHelpers.unmuteURL(results[0].source));
-            this.setStats(tabId, vodBase, quality, {
-                ...stats,
-                state: 'unavailable',
-                message: HIT_STATUSES.has(controlStatus)
-                    ? 'Twitch не хранит оригиналы без «-muted» для этой записи — звук вернуть нельзя.'
-                    : `Проверка сегментов блокируется (контроль=${controlStatus}) — результат ненадёжен.`
-            });
+            await this.reportNothingRestored(tabId, vodBase, quality, results, stats);
             return;
         }
 
-        await this.installRules(tabId, vodBase, quality, signature, initRedirects, restored, epoch, stats);
+        await VODRules.install(this, { tabId, vodBase, quality, signature, initRedirects, restored, epoch, stats });
         if (epoch !== this.epoch(tabId)) return;
         await this.paintSeekbar(tabId, results, quality, playlist.totalDuration);
+    }
+
+    // fMP4 playlists carry an init segment in #EXT-X-MAP: it defines the audio
+    // track, so mixing a muted init with unmuted media breaks decoding and
+    // Twitch reports error #2000.
+    async initRedirects(tabId, vodBase, quality, mutedMaps, mutedCount, epoch) {
+        if (!mutedMaps.length) return [];
+        const groups = mutedMaps.map((entry) => [VODHelpers.unmuteURL(entry.url)]);
+        const statuses = await this.probe(tabId, groups);
+        if (statuses === null || epoch !== this.epoch(tabId)) return null;
+
+        const redirects = [];
+        mutedMaps.forEach((entry, index) => {
+            const status = statuses[index]?.[0];
+            if (VODHelpers.classifyValidation(status).valid) redirects.push({ source: entry.url, url: groups[index][0], quality });
+            else console.warn(`[VOD Unmute] Muted init segment has no original (status=${status}); skipping redirects.`, entry.url);
+        });
+        if (redirects.length === mutedMaps.length) return redirects;
+
+        this.setStats(tabId, vodBase, quality, {
+            ...this.emptyStats(),
+            muted: mutedCount,
+            state: 'unavailable',
+            message: 'Init-сегмент заглушён, а оригинала нет — подмена сломала бы воспроизведение.'
+        });
+        return null;
+    }
+
+    // The muted original is played by Twitch, so it must be reachable. If it is
+    // not, the probing method is at fault rather than the CDN.
+    async reportNothingRestored(tabId, vodBase, quality, results, stats) {
+        const control = await this.probe(tabId, [[results[0].source]]);
+        const controlStatus = control?.[0]?.[0];
+        const codes = [...new Set(results.flatMap((item) => item.statuses))].join(', ') || 'нет';
+        console.warn(`[VOD Unmute] ${quality}: no unmuted files. statuses=${codes}, muted control=${controlStatus}.`);
+        this.setStats(tabId, vodBase, quality, {
+            ...stats,
+            state: 'unavailable',
+            message: HIT_STATUSES.has(controlStatus)
+                ? 'Twitch не хранит оригиналы без «-muted» для этой записи — звук вернуть нельзя.'
+                : `Проверка сегментов блокируется (контроль=${controlStatus}) — результат ненадёжен.`
+        });
     }
 
     dedupe(entries) {
@@ -427,29 +425,7 @@ class VODUnmute {
         return candidates;
     }
 
-    // --- page-context networking --------------------------------------------
-
-    async fetchInPage(tabId, url) {
-        try {
-            const [result] = await chrome.scripting.executeScript({
-                target: { tabId },
-                args: [url],
-                func: async (target) => {
-                    try {
-                        const response = await fetch(target);
-                        if (!response.ok) return null;
-                        return await response.text();
-                    } catch {
-                        return null;
-                    }
-                }
-            });
-            return result?.result ?? null;
-        } catch (error) {
-            console.debug('[VOD Unmute] executeScript failed:', error.message);
-            return null;
-        }
-    }
+    // --- probing ------------------------------------------------------------
 
     cachedStatus(url) {
         const hit = this.probeCache.get(url);
@@ -463,14 +439,14 @@ class VODUnmute {
 
     rememberStatus(url, status) {
         // Only definitive answers are cached: a throttled or failed request must
-        // be retried later instead of poisoning the result for ten minutes.
+        // be retried later instead of poisoning the result.
         if (!HIT_STATUSES.has(status) && status !== 404 && status !== 410) return;
         if (this.probeCache.size >= PROBE_CACHE_LIMIT) this.probeCache.clear();
         this.probeCache.set(url, { status, at: Date.now() });
     }
 
-    // Resolves each candidate group, asking the page only about URLs whose status
-    // is not already known.
+    // Resolves candidate groups, asking the page only about URLs whose status is
+    // not already known.
     async probe(tabId, urlGroups) {
         const statuses = urlGroups.map(() => []);
         const pending = [];
@@ -497,7 +473,7 @@ class VODUnmute {
 
         if (!pending.length) return statuses;
 
-        const fresh = await this.probeInPage(tabId, pending);
+        const fresh = await VODNet.probeInPage(tabId, pending);
         if (fresh === null) return null;
         fresh.forEach((group, position) => {
             const index = owners[position];
@@ -509,160 +485,14 @@ class VODUnmute {
         return statuses;
     }
 
-    async probeInPage(tabId, urlGroups) {
-        try {
-            const [result] = await chrome.scripting.executeScript({
-                target: { tabId },
-                args: [urlGroups],
-                func: async (groups) => {
-                    // A two-byte range request is enough to learn whether the file
-                    // exists, and it never downloads the segment.
-                    const hit = (status) => status === 200 || status === 206;
-                    const definitive = (status) => hit(status) || status === 404 || status === 410;
-                    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-                    const probe = async (url) => {
-                        let status = 0;
-                        for (let attempt = 0; attempt < 3; attempt++) {
-                            const controller = new AbortController();
-                            try {
-                                const response = await fetch(url, {
-                                    method: 'GET',
-                                    headers: { Range: 'bytes=0-1' },
-                                    cache: 'no-store',
-                                    signal: controller.signal
-                                });
-                                status = response.status;
-                                controller.abort();
-                                // 404/410 mean the file is gone; only throttling and
-                                // server errors are worth another attempt.
-                                if (definitive(status)) return status;
-                            } catch {
-                                controller.abort();
-                                status = 0;
-                            }
-                            await wait(200 * (attempt + 1));
-                        }
-                        return status;
-                    };
-                    return await Promise.all(groups.map(async (urls) => {
-                        const statuses = [];
-                        for (const url of urls) {
-                            const status = await probe(url);
-                            statuses.push(status);
-                            if (hit(status)) break;
-                        }
-                        return statuses;
-                    }));
-                }
-            });
-            return result?.result ?? null;
-        } catch (error) {
-            console.debug('[VOD Unmute] Probe failed:', error.message);
-            return null;
-        }
-    }
-
-    // --- rules --------------------------------------------------------------
-
-    allocateRuleId(used) {
-        for (let guard = 0; guard < 1e7; guard++) {
-            if (this.nextRuleId > MAX_RULE_ID) this.nextRuleId = 1;
-            const id = this.nextRuleId++;
-            // After a wrap-around the counter can land on an id another tab is
-            // already using, so taken ids are skipped instead of overwritten.
-            if (!used.has(id)) {
-                used.add(id);
-                return id;
-            }
-        }
-        throw new Error('No free declarativeNetRequest rule id');
-    }
-
-    async installRules(tabId, vodBase, quality, signature, initRedirects, restored, epoch, stats) {
-        await this.serialize(async () => {
-            if (epoch !== this.epoch(tabId)) return;
-            const entry = this.tabs.get(tabId);
-            if (!entry || entry.vodBase !== vodBase) return;
-            const rendition = entry.renditions.get(quality);
-            if (!rendition) return;
-
-            let live;
-            try {
-                live = await chrome.declarativeNetRequest.getSessionRules();
-            } catch (error) {
-                this.setStats(tabId, vodBase, quality, { ...stats, state: 'unavailable', message: `Не удалось прочитать правила: ${error.message}` });
-                return;
-            }
-
-            // Only this rendition's rules are replaced: other qualities of the
-            // same VOD keep working.
-            const ownIds = new Set(rendition.ruleIds);
-            const removeRuleIds = live.filter((rule) => ownIds.has(rule.id)).map((rule) => rule.id);
-            const foreign = live.filter((rule) => !ownIds.has(rule.id));
-            const used = new Set(foreign.map((rule) => rule.id));
-            const budget = Math.max(0, Math.min(MAX_RULES_PER_RENDITION, this.ruleLimit() - foreign.length));
-
-            if (budget <= initRedirects.length) {
-                this.setStats(tabId, vodBase, quality, {
-                    ...stats,
-                    state: 'unavailable',
-                    message: 'Лимит правил Chrome исчерпан другими вкладками — закройте лишние записи и обновите страницу.'
-                });
-                return;
-            }
-
-            const planned = [...initRedirects, ...restored].slice(0, budget);
-            const truncated = initRedirects.length + restored.length - planned.length;
-            const addRules = planned.map((item) => ({
-                id: this.allocateRuleId(used),
-                priority: 1,
-                action: { type: 'redirect', redirect: { url: item.url } },
-                condition: {
-                    // `|` anchors the filter to the start of the URL, so the rule
-                    // matches this exact segment and nothing else.
-                    urlFilter: `|${item.source.split('?')[0]}`,
-                    tabIds: [tabId],
-                    resourceTypes: ['xmlhttprequest', 'media', 'other']
-                }
-            }));
-
-            try {
-                await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds, addRules });
-            } catch (error) {
-                console.warn('[VOD Unmute] Installing rules failed:', error);
-                rendition.ruleIds = [];
-                rendition.signature = null;
-                this.setStats(tabId, vodBase, quality, { ...stats, state: 'unavailable', message: `Не удалось установить правила: ${error.message}` });
-                return;
-            }
-
-            if (epoch !== this.epoch(tabId)) {
-                await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: addRules.map((rule) => rule.id) }).catch(() => {});
-                return;
-            }
-
-            rendition.ruleIds = addRules.map((rule) => rule.id);
-            rendition.signature = signature;
-            rendition.updatedAt = Date.now();
-            const installed = Math.max(0, addRules.length - initRedirects.length);
-            const tail = truncated ? ` Лимит правил Chmore: ${truncated} сегментов пропущено.` : '';
-            rendition.stats = {
-                ...stats,
-                truncated,
-                quality,
-                state: 'ready',
-                message: (stats.muted
-                    ? `Подменяю ${installed} сегментов в ${quality}; ${stats.muted} недоступны.`
-                    : `Подменяю все ${installed} заглушённых сегментов в ${quality}.`) + tail
-            };
-            console.log(`[VOD Unmute] Installed ${addRules.length} redirect rules for ${quality}${truncated ? ` (${truncated} skipped, rule limit)` : ''}.`);
-        });
-    }
+    // --- teardown -----------------------------------------------------------
 
     async cleanupTab(tabId) {
         this.bump(tabId);
         const epoch = this.epoch(tabId);
         this.queue = this.queue.filter((item) => item.tabId !== tabId);
+        // Stale per-tab state used to survive navigation and make the next VOD
+        // skip its only rendition.
         this.activeQuality.delete(tabId);
         this.knownPlaylists.delete(tabId);
         this.paintData.delete(tabId);
@@ -678,7 +508,7 @@ class VODUnmute {
         });
     }
 
-    // A closed tab can never come back, so its counters are dropped too.
+    // A closed tab never comes back, so its counter is dropped too.
     async forgetTab(tabId) {
         await this.cleanupTab(tabId);
         this.epochs.delete(tabId);
@@ -695,7 +525,7 @@ class VODUnmute {
             if (live.length) await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: live.map((rule) => rule.id) });
             this.tabs.clear();
         });
-        for (const tabId of painted) await this.injectPainter(tabId, []);
+        for (const tabId of painted) await VODSeekbar.inject(tabId, []);
     }
 
     // --- seekbar ------------------------------------------------------------
@@ -719,7 +549,7 @@ class VODUnmute {
         if (!data) return;
         const settings = await chrome.storage.sync.get(['seekbar', 'unmutedColour', 'qualityColour', 'opacity']);
         const segments = settings.seekbar === true ? this.colourize(data, settings) : [];
-        await this.injectPainter(tabId, segments);
+        await VODSeekbar.inject(tabId, segments);
     }
 
     colourize({ ranges, totalDuration }, settings) {
@@ -735,57 +565,7 @@ class VODUnmute {
             colour: colours[range.quality] || colours.unmuted
         }));
     }
+}
 
-    async injectPainter(tabId, segments) {
-        try {
-            await chrome.scripting.executeScript({
-                target: { tabId },
-                args: [segments],
-                func: (ranges) => {
-                    const state = window.__vodUnmute || (window.__vodUnmute = {});
-                    state.ranges = ranges;
-                    if (!state.paint) {
-                        state.paint = () => {
-                            const bar = document.querySelector('div.seekbar-bar');
-                            if (!bar || !bar.firstElementChild) return;
-                            bar.querySelectorAll('[data-vod-unmute]').forEach((node) => node.remove());
-                            const list = state.ranges || [];
-                            if (!list.length) return;
-                            const template = bar.firstElementChild;
-                            const thumb = bar.lastElementChild;
-                            for (const range of list) {
-                                const span = template.cloneNode(false);
-                                span.dataset.vodUnmute = '';
-                                span.style.position = 'absolute';
-                                span.style.insetInlineStart = `${range.left}%`;
-                                span.style.width = `${range.width}%`;
-                                span.style.backgroundColor = range.colour;
-                                bar.insertBefore(span, thumb);
-                            }
-                        };
-
-                        let scheduled = false;
-                        let lastSweep = 0;
-                        const schedule = () => {
-                            if (scheduled) return;
-                            scheduled = true;
-                            requestAnimationFrame(() => {
-                                scheduled = false;
-                                state.paint();
-                            });
-                        };
-                        // Twitch rebuilds the player on fullscreen, theatre mode and
-                        // in-app navigation, which throws the overlay away, so the
-                        // seekbar is watched and repainted instead of painted once.
-                        state.observer = new MutationObserver((mutations) => {
-                            for (const mutation of mutations) {
-                                for (const node of mutation.addedNodes) {
-                                    if (node.nodeType !== 1) continue;
-                                    if (node.matches?.('div.seekbar-bar') || node.querySelector?.('div.seekbar-bar')) {
-                                        schedule();
-                                        return;
-                                    }
-                                }
-                            }
-                            const now = Date.now();
-                            if (now - lastSwe
+if (typeof module === 'object' && module.exports) module.exports = { VODUnmute, QUALITIES };
+else new VODUnmute();
