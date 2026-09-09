@@ -1,391 +1,258 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Twitch VOD Unmute</title>
+    <meta charset="utf-8">
+    <title>Twitch VOD Unmute — Modded</title>
     <style>
-        /* Embedded styles - no external dependencies */
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        
+        :root {
+            --bg: #18181b;
+            --panel: #1f1f23;
+            --panel-alt: #26262c;
+            --text: #efeff1;
+            --muted: #adadb8;
+            --accent: #9147ff;
+            --ok: #00c8a0;
+            --warn: #ffb020;
+            --err: #ff5c5c;
+        }
+
+        * { box-sizing: border-box; }
+
         body {
-            background: linear-gradient(135deg, #0e0e10 0%, #1a1a2e 100%);
-            color: #efeff1;
-            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-            min-width: 320px;
-            padding: 16px;
+            width: 320px;
+            margin: 0;
+            padding: 14px;
+            background: var(--bg);
+            color: var(--text);
+            font: 13px/1.45 -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
         }
-        
-        .header {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            margin-bottom: 20px;
-            padding-bottom: 12px;
-            border-bottom: 1px solid #3a3a3d;
-        }
-        
-        .logo {
-            width: 32px;
-            height: 32px;
-            background: #9147ff;
-            border-radius: 6px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: bold;
-            font-size: 14px;
-        }
-        
-        h1 {
-            font-size: 18px;
-            font-weight: 600;
-            color: #9147ff;
-        }
-        
-        .section {
-            background: rgba(255,255,255,0.05);
-            border-radius: 8px;
-            padding: 12px;
-            margin-bottom: 12px;
-            border: 1px solid rgba(255,255,255,0.1);
-        }
-        
-        .section-title {
-            font-size: 11px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: #adadb8;
-            margin-bottom: 10px;
-        }
-        
-        .toggle-row {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 8px 0;
-            cursor: pointer;
-            transition: opacity 0.2s;
-            width: 100%;
-            border: 0;
-            color: inherit;
-            background: transparent;
-            font: inherit;
-            text-align: left;
-        }
-        
-        .toggle-row:hover { opacity: 0.8; }
-        .toggle-row:focus-visible { outline: 2px solid #bf94ff; outline-offset: 2px; }
-        #colorSettings[aria-disabled="true"] { opacity: 0.45; }
-        #colorSettings[aria-disabled="true"] input { cursor: not-allowed; }
-        
-        .toggle-label {
+
+        header {
             display: flex;
             align-items: center;
             gap: 8px;
-            font-size: 13px;
+            margin-bottom: 12px;
         }
-        
-        .toggle {
-            width: 36px;
-            height: 20px;
-            background: #3a3a3d;
+
+        header h1 {
+            flex: 1;
+            margin: 0;
+            font-size: 14px;
+            font-weight: 600;
+        }
+
+        .badge {
+            padding: 2px 7px;
             border-radius: 10px;
-            position: relative;
-            transition: background 0.3s;
+            background: var(--accent);
+            color: #fff;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: .04em;
+            text-transform: uppercase;
         }
-        
-        .toggle.active {
-            background: #9147ff;
+
+        section {
+            margin-bottom: 10px;
+            padding: 10px 12px;
+            border-radius: 8px;
+            background: var(--panel);
         }
-        
-        .toggle::after {
-            content: '';
+
+        h2 {
+            margin: 0 0 8px;
+            color: var(--muted);
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: .06em;
+            text-transform: uppercase;
+        }
+
+        .row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            min-height: 26px;
+        }
+
+        .row + .row { margin-top: 8px; }
+        .row span.label { flex: 1; }
+        .hint { margin: 4px 0 0; color: var(--muted); font-size: 11px; }
+
+        .switch { position: relative; width: 38px; height: 20px; flex: none; }
+        .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+
+        .switch .track {
+            display: block;
+            width: 38px;
+            height: 20px;
+            border-radius: 10px;
+            background: #4b4b55;
+            transition: background .15s ease;
+            cursor: pointer;
+        }
+
+        .switch .track::after {
+            content: "";
             position: absolute;
+            top: 2px;
+            inset-inline-start: 2px;
             width: 16px;
             height: 16px;
-            background: white;
             border-radius: 50%;
-            top: 2px;
-            left: 2px;
-            transition: transform 0.3s;
+            background: #fff;
+            transition: transform .15s ease;
         }
-        
-        .toggle.active::after {
-            transform: translateX(16px);
-        }
-        
-        .color-row {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 6px 0;
-            font-size: 13px;
-        }
-        
-        .color-input {
-            width: 40px;
+
+        .switch input:checked + .track { background: var(--accent); }
+        .switch input:checked + .track::after { transform: translateX(18px); }
+        .switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+        input[type="color"] {
+            width: 34px;
             height: 24px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            background: transparent;
-        }
-        
-        .slider-row {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            padding: 6px 0;
-            font-size: 13px;
-        }
-        
-        input[type="range"] {
-            flex: 1;
-            height: 4px;
-            -webkit-appearance: none;
-            background: #3a3a3d;
-            border-radius: 2px;
-            outline: none;
-        }
-        
-        input[type="range"]::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            width: 14px;
-            height: 14px;
-            background: #9147ff;
-            border-radius: 50%;
-            cursor: pointer;
-        }
-        
-        .vod-status {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            min-height: 18px;
-            margin: 8px 0 10px;
-            padding: 8px 10px;
-            border: 1px solid #3a3a3d;
+            padding: 0;
+            border: 1px solid #3a3a42;
             border-radius: 5px;
-            background: rgba(0, 0, 0, 0.2);
-            color: #adadb8;
-            font-size: 12px;
-            line-height: 1.35;
+            background: none;
+            cursor: pointer;
         }
-        .vod-status::before {
-            content: '';
-            width: 7px;
-            height: 7px;
-            flex: 0 0 7px;
-            border-radius: 50%;
-            background: #adadb8;
+
+        input[type="range"] { flex: 1; accent-color: var(--accent); }
+        #opacityValue { min-width: 38px; color: var(--muted); text-align: right; }
+
+        #vodStatus {
+            padding: 8px 10px;
+            border-inline-start: 3px solid var(--muted);
+            border-radius: 5px;
+            background: var(--panel-alt);
+            color: var(--muted);
         }
-        .vod-status.processing::before,
-        .vod-status.queued::before,
-        .vod-status.loading::before,
-        .vod-status.candidate::before {
-            background: #ffff00;
-            animation: statusPulse 1s ease-in-out infinite;
-        }
-        .vod-status.candidate::before { background: #9147ff; }
-        .vod-status.ready::before { background: #00ff00; }
-        .vod-status.unavailable::before { background: #ff4444; }
-        @keyframes statusPulse {
-            50% { opacity: 0.35; }
-        }
-        .stats-grid {
+
+        #vodStatus[data-state="ready"] { border-color: var(--ok); color: var(--text); }
+        #vodStatus[data-state="processing"],
+        #vodStatus[data-state="loading"],
+        #vodStatus[data-state="queued"],
+        #vodStatus[data-state="candidate"] { border-color: var(--warn); color: var(--text); }
+        #vodStatus[data-state="unavailable"] { border-color: var(--err); color: var(--text); }
+
+        #statsGrid {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
-            gap: 8px;
+            gap: 6px;
+            margin-top: 10px;
+        }
+
+        .stat {
+            padding: 8px 4px;
+            border-radius: 6px;
+            background: var(--panel-alt);
+            text-align: center;
+        }
+
+        .stat b { display: block; font-size: 16px; }
+        .stat small { color: var(--muted); font-size: 10px; }
+        .stat.unmuted b { color: var(--ok); }
+        .stat.lower b { color: var(--warn); }
+        .stat.muted b { color: var(--err); }
+
+        #statQuality {
             margin-top: 8px;
-        }
-        
-        .stat-box {
-            background: rgba(0,0,0,0.3);
-            padding: 8px;
-            border-radius: 6px;
+            color: var(--muted);
+            font-size: 11px;
             text-align: center;
         }
-        
-        .stat-value {
-            font-size: 18px;
-            font-weight: bold;
-            display: block;
-        }
-        
-        .stat-label {
-            font-size: 10px;
-            color: #adadb8;
-        }
-        
-        .unmuted { color: #00ff00; }
-        .muted { color: #ff4444; }
-        .lower { color: #ffff00; }
-        
-        .actions {
-            display: flex;
-            gap: 8px;
-            margin-top: 16px;
-        }
-        
-        .actions button {
+
+        .actions { display: flex; gap: 8px; }
+
+        button {
             flex: 1;
-            padding: 8px 12px;
-            border: none;
+            padding: 8px 6px;
+            border: 1px solid #3a3a42;
             border-radius: 6px;
-            font-size: 12px;
+            background: var(--panel-alt);
+            color: var(--text);
+            font: inherit;
             cursor: pointer;
-            transition: all 0.2s;
-            font-weight: 500;
         }
-        
-        .btn-primary {
-            background: #9147ff;
-            color: white;
-        }
-        
-        .btn-primary:hover { background: #772ce8; }
-        
-        .btn-secondary {
-            background: #3a3a3d;
-            color: #efeff1;
-        }
-        
-        .btn-secondary:hover { background: #4a4a4d; }
-        
-        .hidden { display: none; }
-        
-        .info-icon {
-            display: inline-flex;
-            width: 14px;
-            height: 14px;
-            background: #5c5c5c;
-            color: white;
-            border-radius: 50%;
-            font-size: 10px;
-            align-items: center;
-            justify-content: center;
-            cursor: help;
-            position: relative;
-        }
-        
-        .info-icon:hover::after {
-            content: attr(data-tooltip);
-            position: absolute;
-            bottom: 100%;
-            left: 50%;
-            transform: translateX(-50%);
-            background: #222;
-            color: white;
-            padding: 6px 10px;
-            border-radius: 4px;
-            font-size: 11px;
-            white-space: normal;
-            width: 180px;
-            z-index: 1000;
-            border: 1px solid #444;
-        }
-        
-        .footer {
-            margin-top: 16px;
-            padding-top: 12px;
-            border-top: 1px solid #3a3a3d;
-            font-size: 11px;
-            color: #adadb8;
-            text-align: center;
-        }
+
+        button:hover { border-color: var(--accent); }
+        footer { color: var(--muted); font-size: 10px; text-align: center; }
     </style>
 </head>
 <body>
-    <div class="header">
-        <div class="logo">TV</div>
+    <header>
         <h1>Twitch VOD Unmute</h1>
-    </div>
+        <span class="badge">Modded</span>
+    </header>
 
-    <!-- Main Toggle -->
-    <div class="section">
-        <button type="button" class="toggle-row" id="extensionToggle" role="switch" aria-checked="false">
-            <div class="toggle-label">
-                <span>Enable Extension</span>
-            </div>
-            <div class="toggle" id="extensionToggleSwitch"></div>
-        </button>
-    </div>
-
-    <!-- Statistics (New Feature) -->
-    <div class="section" id="statsSection">
-        <div class="section-title">Current VOD Statistics</div>
-        <div class="vod-status waiting" id="vodStatus" role="status" aria-live="polite">Waiting for a Twitch VOD playlist…</div>
-        <div class="stats-grid" id="statsGrid" hidden>
-            <div class="stat-box">
-                <span class="stat-value unmuted" id="statUnmuted">0</span>
-                <span class="stat-label">Unmuted</span>
-            </div>
-            <div class="stat-box">
-                <span class="stat-value lower" id="statLower">0</span>
-                <span class="stat-label">Lower Q</span>
-            </div>
-            <div class="stat-box">
-                <span class="stat-value muted" id="statMuted">0</span>
-                <span class="stat-label">Muted</span>
-            </div>
+    <section>
+        <div class="row">
+            <span class="label">Включить расширение</span>
+            <label class="switch">
+                <input type="checkbox" id="extensionToggle">
+                <span class="track"></span>
+            </label>
         </div>
-    </div>
+    </section>
 
-    <!-- Seekbar Settings -->
-    <div class="section">
-        <div class="section-title">Restored Segment Overlay</div>
-        
-        <button type="button" class="toggle-row" id="seekbarToggle" role="switch" aria-checked="false">
-            <div class="toggle-label">
-                <span>Show Restored Segments</span>
-                <span class="info-icon" aria-hidden="true" data-tooltip="Adds a green overlay only where this extension restored audio; Twitch keeps its own muted markers">?</span>
-            </div>
-            <div class="toggle" id="seekbarToggleSwitch"></div>
-        </button>
+    <section>
+        <h2>Статистика текущей записи</h2>
+        <div id="vodStatus" data-state="waiting">Ожидание плейлиста…</div>
+        <div id="statsGrid" hidden>
+            <div class="stat unmuted"><b id="statUnmuted">0</b><small>Со звуком</small></div>
+            <div class="stat lower"><b id="statLower">0</b><small>Ниже качество</small></div>
+            <div class="stat muted"><b id="statMuted">0</b><small>Без звука</small></div>
+        </div>
+        <div id="statQuality">Качество: не определено</div>
+    </section>
 
+    <section>
+        <h2>Подсветка восстановленных участков</h2>
+        <div class="row">
+            <span class="label">Показывать на полосе прокрутки</span>
+            <label class="switch">
+                <input type="checkbox" id="seekbarToggle">
+                <span class="track"></span>
+            </label>
+        </div>
         <div id="colorSettings">
-            <div class="color-row">
-                <label for="unmutedColour">Unmuted</label>
-                <input type="color" class="color-input" id="unmutedColour" value="#00FF00">
+            <div class="row">
+                <span class="label">Со звуком</span>
+                <input type="color" id="unmutedColour" value="#00FF00">
             </div>
-            <div class="color-row">
-                <label for="qualityColour">Lower quality</label>
-                <input type="color" class="color-input" id="qualityColour" value="#FFFF00">
+            <div class="row">
+                <span class="label">Из низкого качества</span>
+                <input type="color" id="qualityColour" value="#FFFF00">
             </div>
-            <div class="slider-row">
-                <label for="opacity">Opacity</label>
-                <input type="range" id="opacity" min="0" max="1" step="0.05" value="0.5" aria-describedby="opacityValue">
-                <output id="opacityValue" for="opacity">50%</output>
+            <div class="row">
+                <span class="label">Прозрачность</span>
+                <input type="range" id="opacity" min="0.1" max="1" step="0.05" value="0.5">
+                <span id="opacityValue">50%</span>
             </div>
         </div>
-    </div>
+    </section>
 
-    <!-- Quality Settings -->
-    <div class="section">
-        <div class="section-title">Quality Settings</div>
-        
-        <button type="button" class="toggle-row" id="qualityToggle" role="switch" aria-checked="false">
-            <div class="toggle-label">
-                <span>Allow Lower Quality</span>
-                <span class="info-icon" aria-hidden="true" data-tooltip="Use lower quality video if the selected quality has muted segments">?</span>
-            </div>
-            <div class="toggle" id="qualityToggleSwitch"></div>
-        </button>
+    <section>
+        <h2>Настройки качества</h2>
+        <div class="row">
+            <span class="label">Разрешить низкое качество</span>
+            <label class="switch">
+                <input type="checkbox" id="qualityToggle">
+                <span class="track"></span>
+            </label>
+        </div>
+        <p class="hint">Если в текущем качестве оригинала нет, расширение возьмёт звук из более низкого.</p>
+    </section>
 
-    </div>
+    <section class="actions">
+        <button id="exportBtn" type="button">Экспорт настроек</button>
+        <button id="refreshBtn" type="button">Перезагрузить запись</button>
+    </section>
 
-    <!-- Actions -->
-    <div class="actions">
-        <button class="btn-secondary" id="exportBtn">Export Settings</button>
-        <button class="btn-primary" id="refreshBtn">Refresh VOD</button>
-    </div>
+    <footer>После смены настроек качества перезагрузите страницу с записью.</footer>
 
-    <div class="footer">
-        Refresh the VOD page after changing quality fallback settings
-    </div>
-
-    <script src="helpers.js"></script>
     <script src="popup.js"></script>
 </body>
 </html>
