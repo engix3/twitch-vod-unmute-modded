@@ -17,6 +17,8 @@ const ACTIVE_TTL_MS = 60 * 1000;
 // Twitch re-requests the same media playlist over and over; a rendition with a
 // verdict is not downloaded again until this window passes.
 const RECHECK_AFTER_MS = 30 * 1000;
+// How often the page timeline may be scanned for playlists we never saw.
+const DISCOVER_EVERY_MS = 10 * 1000;
 const HIT_STATUSES = new Set([200, 206]);
 
 class VODUnmute {
@@ -27,6 +29,8 @@ class VODUnmute {
         this.knownPlaylists = new Map();  // tabId -> Set<playlistURL>
         this.paintData = new Map();       // tabId -> { ranges, totalDuration }
         this.probeCache = new Map();      // candidate URL -> { status, at }
+        this.tabPages = new Map();        // tabId -> page identity (VOD id)
+        this.discoveredAt = new Map();    // tabId -> last timeline scan
         this.queue = [];
         this.working = false;
         this.mutations = Promise.resolve();
@@ -48,9 +52,7 @@ class VODUnmute {
         });
 
         chrome.tabs.onRemoved.addListener((tabId) => this.forgetTab(tabId).catch(() => {}));
-        chrome.tabs.onUpdated.addListener((tabId, change) => {
-            if (change.status === 'loading' || change.url) this.cleanupTab(tabId).catch(() => {});
-        });
+        chrome.tabs.onUpdated.addListener((tabId, change) => this.onTabUpdated(tabId, change));
 
         // Playlists are picked up when the request starts, not when it finishes,
         // so the rules are ready as early as possible.
@@ -62,10 +64,48 @@ class VODUnmute {
         chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             if (request.action !== 'getStats') return false;
             chrome.tabs.query({ active: true, currentWindow: true })
-                .then((tabs) => sendResponse(this.statsFor(tabs[0]?.id)))
+                .then((tabs) => {
+                    const tabId = tabs[0]?.id;
+                    const stats = this.statsFor(tabId);
+                    // Nothing is known about this tab: the playlist request was
+                    // probably missed, so it is looked up in the page timeline.
+                    if (stats.state === 'waiting' && Number.isInteger(tabId)) {
+                        this.discover(tabId).catch(() => {});
+                    }
+                    sendResponse(stats);
+                })
                 .catch(() => sendResponse(this.emptyStats()));
             return true;
         });
+    }
+
+    // Twitch is a single-page app: it rewrites the URL while playing (seek
+    // timestamps, filters, chat state). Wiping the tab there used to abort the
+    // running check and leave the popup on "waiting for a playlist" forever,
+    // because Twitch never requests the same playlist twice.
+    onTabUpdated(tabId, change) {
+        if (typeof change.url === 'string') {
+            const page = this.pageKey(change.url);
+            const previous = this.tabPages.get(tabId);
+            this.tabPages.set(tabId, page);
+            if (previous === page) return;
+            this.cleanupTab(tabId).catch(() => {});
+            return;
+        }
+        // A real document load (F5, back/forward) does re-request everything.
+        if (change.status === 'loading') this.cleanupTab(tabId).catch(() => {});
+    }
+
+    // Two URLs of the same recording share an identity, so `?t=1h2m3s` is not a
+    // new page.
+    pageKey(url) {
+        try {
+            const parsed = new URL(url);
+            const video = parsed.pathname.match(/\/videos\/(\d+)/);
+            return video ? `video:${video[1]}` : `${parsed.origin}${parsed.pathname}`;
+        } catch {
+            return url;
+        }
     }
 
     async onSettingsChanged(changes) {
@@ -164,6 +204,24 @@ class VODUnmute {
         if (SEGMENT_PATTERN.test(file)) this.onSegmentRequest(details);
     }
 
+    // A playlist request is easy to miss (asleep service worker, extension
+    // enabled mid-playback, tab state reset), and Twitch will not repeat it.
+    // The page's own resource timeline still holds every playlist it loaded.
+    async discover(tabId) {
+        const last = this.discoveredAt.get(tabId) || 0;
+        if (Date.now() - last < DISCOVER_EVERY_MS) return;
+        this.discoveredAt.set(tabId, Date.now());
+        if ((await chrome.storage.sync.get('enabled')).enabled !== true) return;
+        const found = await VODNet.discoverPlaylists(tabId);
+        const playlists = [...new Set(found)].filter((url) => VODHelpers.isAllowedMediaURL(url));
+        if (!playlists.length) return;
+        console.log(`[VOD Unmute] Recovered ${playlists.length} playlist(s) from the page timeline.`);
+        for (const url of playlists) {
+            this.remember(tabId, url);
+            this.enqueue(tabId, url);
+        }
+    }
+
     enqueue(tabId, url) {
         if (this.queue.some((item) => item.tabId === tabId && item.url === url)) return;
         this.queue.push({ tabId, url, epoch: this.epoch(tabId) });
@@ -209,10 +267,15 @@ class VODUnmute {
     }
 
     // Only renditions without a verdict are re-queued; one that was already
-    // checked must not be probed again on every quality switch.
+    // checked must not be probed again on every quality switch. A rendition we
+    // have never seen a playlist for is looked up in the page timeline.
     requeueActive(tabId, quality) {
         const rendition = this.tabs.get(tabId)?.renditions.get(quality);
-        if (!rendition || rendition.signature !== null || rendition.playlistURL === undefined) return;
+        if (!rendition || rendition.playlistURL === undefined) {
+            this.discover(tabId).catch(() => {});
+            return;
+        }
+        if (rendition.signature !== null) return;
         this.enqueue(tabId, rendition.playlistURL);
     }
 
@@ -300,7 +363,10 @@ class VODUnmute {
             console.warn('[VOD Unmute] Playlist download failed in page context:', url);
             return;
         }
-        if (epoch !== this.epoch(tabId)) return;
+        if (epoch !== this.epoch(tabId)) {
+            console.log('[VOD Unmute] Check dropped: the tab state changed while the playlist was loading.');
+            return;
+        }
 
         let playlist;
         try {
@@ -327,7 +393,11 @@ class VODUnmute {
         }
         rendition.signature = signature;
         rendition.checkedAt = Date.now();
-        const giveUp = () => { rendition.signature = null; rendition.checkedAt = 0; };
+        const giveUp = (reason) => {
+            rendition.signature = null;
+            rendition.checkedAt = 0;
+            if (reason) console.log(`[VOD Unmute] Check dropped: ${reason}`);
+        };
 
         console.log(`[VOD Unmute] ${quality}: ${media.length} segments, ${mutedMedia.length} muted, ${mutedMaps.length} muted init.`);
 
@@ -354,19 +424,19 @@ class VODUnmute {
         const results = [];
         let checked = 0;
         for (let start = 0; start < mutedMedia.length; start += BATCH_SIZE) {
-            if (epoch !== this.epoch(tabId)) { giveUp(); return; }
+            if (epoch !== this.epoch(tabId)) { giveUp('the tab state changed mid-check.'); return; }
             const batch = mutedMedia.slice(start, start + BATCH_SIZE);
             const attempts = batch.map((entry) => this.candidatesFor(entry, quality, perSegmentLower));
             const responses = await this.probe(tabId, attempts.map((list) => list.map((item) => item.url)));
             if (responses === null) {
-                giveUp();
+                giveUp('the page stopped answering probes.');
                 this.setStats(tabId, vodBase, quality, {
                     state: 'unavailable',
                     message: `${quality}: проверка остановлена на ${checked}/${mutedMedia.length}; перезагрузите страницу.`
                 });
                 return;
             }
-            if (epoch !== this.epoch(tabId)) { giveUp(); return; }
+            if (epoch !== this.epoch(tabId)) { giveUp('the tab state changed mid-check.'); return; }
 
             batch.forEach((entry, index) => {
                 const statuses = responses[index] || [];
@@ -551,6 +621,8 @@ class VODUnmute {
         this.activeQualities.delete(tabId);
         this.knownPlaylists.delete(tabId);
         this.paintData.delete(tabId);
+        // The new page has its own timeline, so it may be scanned right away.
+        this.discoveredAt.delete(tabId);
         await this.serialize(async () => {
             const live = await chrome.declarativeNetRequest.getSessionRules();
             const entry = this.tabs.get(tabId);
@@ -567,12 +639,14 @@ class VODUnmute {
     async forgetTab(tabId) {
         await this.cleanupTab(tabId);
         this.epochs.delete(tabId);
+        this.tabPages.delete(tabId);
     }
 
     async clearAll() {
         for (const tabId of [...this.tabs.keys(), ...this.epochs.keys()]) this.bump(tabId);
         this.queue = [];
         this.activeQualities.clear();
+        this.discoveredAt.clear();
         const painted = [...this.paintData.keys()];
         this.paintData.clear();
         await this.serialize(async () => {
