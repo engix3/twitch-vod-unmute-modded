@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const BASE = 'https://d1.cloudfront.net/abcdef';
 const QUALITY = '720p60';
 const PLAYLIST = `${BASE}/${QUALITY}/index-muted-ABC123.m3u8`;
+const PAGE = 'https://www.twitch.tv/videos/123456789';
 
 function makePlaylist(segments, map) {
     const lines = ['#EXTM3U', '#EXT-X-VERSION:4', '#EXT-X-TARGETDURATION:10'];
@@ -13,10 +14,11 @@ function makePlaylist(segments, map) {
     return lines.join('\n');
 }
 
-function createEnvironment({ playlists = {}, statuses = {}, settings = {}, existingRules = [] } = {}) {
+function createEnvironment({ playlists = {}, statuses = {}, settings = {}, existingRules = [], resources = [] } = {}) {
     const env = {
         fetches: [],
         updates: [],
+        listeners: {},
         rules: existingRules.map((rule) => ({ ...rule })),
         settings: {
             enabled: true, seekbar: true, quality: true,
@@ -39,11 +41,23 @@ function createEnvironment({ playlists = {}, statuses = {}, settings = {}, exist
         return { ok: status >= 200 && status < 300, status, text: async () => '' };
     };
 
+    // The page timeline is what playlist recovery reads.
+    const timeline = { getEntriesByType: () => resources.map((name) => ({ name })) };
+    try {
+        Object.defineProperty(globalThis, 'performance', { value: timeline, configurable: true, writable: true });
+    } catch {
+        globalThis.performance = timeline;
+    }
+
     globalThis.window = {};
     globalThis.chrome = {
-        runtime: { onInstalled: { addListener() {} }, onMessage: { addListener() {} } },
-        tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} }, query: async () => [{ id: 1 }] },
-        webRequest: { onBeforeRequest: { addListener() {} } },
+        runtime: { onInstalled: { addListener() {} }, onMessage: { addListener(fn) { env.listeners.message = fn; } } },
+        tabs: {
+            onRemoved: { addListener() {} },
+            onUpdated: { addListener(fn) { env.listeners.tabUpdated = fn; } },
+            query: async () => [{ id: 1 }]
+        },
+        webRequest: { onBeforeRequest: { addListener(fn) { env.listeners.request = fn; } } },
         storage: {
             onChanged: { addListener() {} },
             sync: {
@@ -84,6 +98,16 @@ const forget = (env) => {
     const rendition = env.unmute.tabs.get(1).renditions.get(QUALITY);
     rendition.signature = null;
     rendition.checkedAt = 0;
+};
+const settle = async (env) => {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await env.unmute.mutations;
+};
+const waitForState = async (env, state) => {
+    for (let attempt = 0; attempt < 200 && env.unmute.statsFor(1).state !== state; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return env.unmute.statsFor(1);
 };
 
 test('muted segments become exact redirect rules', async () => {
@@ -241,6 +265,69 @@ test('quality switching does not restart a finished check', async () => {
     assert.equal(env.unmute.isActiveQuality(1, '360p30'), true);
     assert.equal(env.unmute.isActiveQuality(1, '160p30'), false);
     assert.equal(env.fetches.length, before);
+});
+
+test('a URL change inside the same recording keeps the installed rules', async () => {
+    const env = createEnvironment({
+        playlists: { [PLAYLIST]: makePlaylist(['1-muted.ts']) },
+        statuses: { [`${BASE}/${QUALITY}/1.ts`]: 200 }
+    });
+
+    await run(env);
+    assert.equal(env.unmute.statsFor(1).state, 'ready');
+
+    // Twitch rewrites the URL while playing (seek timestamps, filters): that is
+    // the same recording and must not drop the state, otherwise the popup is
+    // stuck on "waiting for a playlist" with no request left to catch.
+    env.listeners.tabUpdated(1, { url: PAGE });
+    env.listeners.tabUpdated(1, { url: `${PAGE}?t=1h2m3s` });
+    await settle(env);
+    assert.equal(env.unmute.statsFor(1).state, 'ready');
+    assert.equal(env.rules.length, 1);
+
+    // A different recording is a real reset.
+    env.listeners.tabUpdated(1, { url: 'https://www.twitch.tv/videos/987654321' });
+    await settle(env);
+    assert.equal(env.unmute.statsFor(1).state, 'waiting');
+    assert.equal(env.rules.length, 0);
+});
+
+test('a missed playlist is recovered from the page resource timeline', async () => {
+    const env = createEnvironment({
+        resources: ['https://www.twitch.tv/app.js', PLAYLIST],
+        playlists: { [PLAYLIST]: makePlaylist(['1-muted.ts']) },
+        statuses: { [`${BASE}/${QUALITY}/1.ts`]: 200 }
+    });
+
+    // The playlist request was never seen by the extension.
+    assert.equal(env.unmute.statsFor(1).state, 'waiting');
+
+    await env.unmute.discover(1);
+    const stats = await waitForState(env, 'ready');
+
+    assert.equal(stats.state, 'ready');
+    assert.equal(stats.unmuted, 1);
+    assert.equal(env.updates[0].addRules[0].condition.urlFilter, `|${BASE}/${QUALITY}/1-muted.ts`);
+});
+
+test('rules left behind by a previous service worker are replaced', async () => {
+    const env = createEnvironment({
+        settings: { quality: false },
+        playlists: { [PLAYLIST]: makePlaylist(['1-muted.ts']) },
+        statuses: { [`${BASE}/${QUALITY}/1.ts`]: 200 },
+        existingRules: [{
+            id: 777,
+            priority: 1,
+            action: { type: 'redirect', redirect: { url: `${BASE}/${QUALITY}/1.ts` } },
+            condition: { urlFilter: `|${BASE}/${QUALITY}/1-muted.ts`, tabIds: [1], resourceTypes: ['media'] }
+        }]
+    });
+
+    await run(env);
+
+    assert.deepEqual(env.updates[0].removeRuleIds, [777]);
+    assert.equal(env.rules.length, 1);
+    assert.equal(env.rules.filter((rule) => rule.condition.urlFilter === `|${BASE}/${QUALITY}/1-muted.ts`).length, 1);
 });
 
 test('the Chrome session rule budget is respected and reported', async () => {
