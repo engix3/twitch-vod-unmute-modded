@@ -66,8 +66,6 @@
                 target: { tabId },
                 args: [urlGroups],
                 func: async (groups) => {
-                    // A two-byte range request tells us whether the file exists
-                    // without ever downloading the segment.
                     const hit = (status) => status === 200 || status === 206;
                     // 404/410 mean the file is gone, 401/403 mean the CDN will
                     // not serve it at all: both are final answers. Only
@@ -75,17 +73,17 @@
                     const definitive = (status) => hit(status) ||
                         status === 401 || status === 403 || status === 404 || status === 410;
                     const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                    // A plain GET, aborted the moment the headers arrive, so the
+                    // body is never downloaded. Range requests cannot be used
+                    // here: the Twitch CDN answers 403 to `Range: bytes=0-1` on
+                    // segments that exist and are served normally without it,
+                    // which made every original look deleted.
                     const probe = async (url) => {
                         let status = 0;
                         for (let attempt = 0; attempt < 3; attempt++) {
                             const controller = new AbortController();
                             try {
-                                const response = await fetch(url, {
-                                    method: 'GET',
-                                    headers: { Range: 'bytes=0-1' },
-                                    cache: 'no-store',
-                                    signal: controller.signal
-                                });
+                                const response = await fetch(url, { signal: controller.signal });
                                 status = response.status;
                                 controller.abort();
                                 if (definitive(status)) return status;
