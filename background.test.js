@@ -1,131 +1,222 @@
-'use strict';
-
+const test = require('node:test');
 const assert = require('node:assert/strict');
-global.VODHelpers = require('./helpers.js');
 
-const event = () => ({ addListener() {} });
-const vodBase = 'https://dgeft87wbj63p.cloudfront.net/abcdef_streamer_123_456';
-const playlistURL = `${vodBase}/720p60/index-muted-JW6XYZ.m3u8`;
-const playlist = [
-    '#EXTM3U',
-    '#EXTINF:10,',
-    '0-muted.mp4',
-    '#EXTINF:10,',
-    '1-muted.mp4',
-    '#EXTINF:10,',
-    '2-muted.mp4',
-    '#EXTINF:10,',
-    '3.mp4',
-    ''
-].join('\n');
+const BASE = 'https://d1.cloudfront.net/abcdef';
+const QUALITY = '720p60';
+const PLAYLIST = `${BASE}/${QUALITY}/index-muted-ABC123.m3u8`;
 
-// Only 0 and 1 still have unmuted originals; 2 is gone at every quality.
-const availableInPage = new Set([
-    `${vodBase}/720p60/0.mp4`,
-    `${vodBase}/720p60/1.mp4`
-]);
+function makePlaylist(segments, map) {
+    const lines = ['#EXTM3U', '#EXT-X-VERSION:4', '#EXT-X-TARGETDURATION:10'];
+    if (map) lines.push(`#EXT-X-MAP:URI="${map}"`);
+    for (const name of segments) lines.push('#EXTINF:10.000,', name);
+    lines.push('#EXT-X-ENDLIST');
+    return lines.join('\n');
+}
 
-let sessionRules = [];
-const injections = [];
+function createEnvironment({ playlists = {}, statuses = {}, settings = {}, existingRules = [] } = {}) {
+    const env = {
+        fetches: [],
+        updates: [],
+        rules: existingRules.map((rule) => ({ ...rule })),
+        settings: {
+            enabled: true, seekbar: true, quality: true,
+            unmutedColour: '#00FF00', qualityColour: '#FFFF00', opacity: 0.5,
+            ...settings
+        }
+    };
 
-global.chrome = {
-    runtime: { onInstalled: event(), onMessage: event() },
-    storage: {
-        sync: {
-            async get(keys) {
-                const all = { enabled: true, quality: true, seekbar: true, unmutedColour: '#00FF00', qualityColour: '#FFFF00', opacity: 0.5 };
-                if (typeof keys === 'string') return { [keys]: all[keys] };
-                return Object.fromEntries((keys || []).map((key) => [key, all[key]]));
-            },
-            async set() {}
+    const statusFor = (url) => {
+        const value = statuses[url];
+        if (value === undefined) return 404;
+        if (Array.isArray(value)) return value.length > 1 ? value.shift() : value[0];
+        return value;
+    };
+
+    globalThis.fetch = async (url, options = {}) => {
+        env.fetches.push({ url, options });
+        if (url in playlists) return { ok: true, status: 200, text: async () => playlists[url] };
+        const status = statusFor(url);
+        return { ok: status >= 200 && status < 300, status, text: async () => '' };
+    };
+
+    globalThis.window = {};
+    globalThis.chrome = {
+        runtime: { onInstalled: { addListener() {} }, onMessage: { addListener() {} } },
+        tabs: { onRemoved: { addListener() {} }, onUpdated: { addListener() {} }, query: async () => [{ id: 1 }] },
+        webRequest: { onBeforeRequest: { addListener() {} } },
+        storage: {
+            onChanged: { addListener() {} },
+            sync: {
+                get: async (keys) => {
+                    const list = typeof keys === 'string' ? [keys] : Array.isArray(keys) ? keys : Object.keys(keys || {});
+                    return Object.fromEntries(list
+                        .filter((key) => env.settings[key] !== undefined)
+                        .map((key) => [key, env.settings[key]]));
+                },
+                set: async (values) => { Object.assign(env.settings, values); }
+            }
         },
-        onChanged: event()
-    },
-    tabs: {
-        onRemoved: event(),
-        onUpdated: event(),
-        async query() { return [{ id: 5 }]; }
-    },
-    webRequest: { onCompleted: event(), onBeforeRequest: event() },
-    declarativeNetRequest: {
-        async getSessionRules() { return JSON.parse(JSON.stringify(sessionRules)); },
-        async updateSessionRules({ removeRuleIds = [], addRules = [] }) {
-            sessionRules = sessionRules.filter((rule) => !removeRuleIds.includes(rule.id));
-            sessionRules.push(...JSON.parse(JSON.stringify(addRules)));
+        // The injected functions are executed directly, so the page-side probing
+        // and painting code is covered by the tests too.
+        scripting: { executeScript: async ({ args = [], func }) => [{ result: await func(...args) }] },
+        declarativeNetRequest: {
+            MAX_NUMBER_OF_SESSION_RULES: 5000,
+            getSessionRules: async () => env.rules.map((rule) => ({ ...rule })),
+            updateSessionRules: async ({ removeRuleIds = [], addRules = [] }) => {
+                env.updates.push({ removeRuleIds, addRules });
+                env.rules = env.rules.filter((rule) => !removeRuleIds.includes(rule.id)).concat(addRules);
+            }
         }
-    },
-    scripting: {
-        async executeScript({ args, func }) {
-            injections.push(args);
-            // Emulate the page context: fetch resolves for stored objects only.
-            const result = await func(...args, ...[]);
-            return [{ result }];
+    };
+
+    globalThis.VODHelpers = require('./helpers.js');
+    globalThis.VODNet = require('./net.js');
+    globalThis.VODRules = require('./rules.js');
+    globalThis.VODSeekbar = require('./seekbar.js');
+    const { VODUnmute } = require('./background.js');
+    env.unmute = new VODUnmute();
+    return env;
+}
+
+const run = (env, epoch = 0) => env.unmute.process({ tabId: 1, url: PLAYLIST, epoch });
+const probes = (env, url) => env.fetches.filter((item) => item.url === url).length;
+
+test('muted segments become exact redirect rules', async () => {
+    const env = createEnvironment({
+        playlists: { [PLAYLIST]: makePlaylist(['1-muted.ts', '2-muted.ts', '3-muted.ts']) },
+        statuses: {
+            [`${BASE}/${QUALITY}/1.ts`]: 200,
+            [`${BASE}/${QUALITY}/2.ts`]: 206,
+            [`${BASE}/${QUALITY}/3.ts`]: 200
         }
-    }
-};
+    });
 
-// The injected functions call fetch inside the page; emulate CDN behaviour.
-global.fetch = async (url, options = {}) => {
-    const target = String(url);
-    if (target === playlistURL) {
-        return { ok: true, status: 200, async text() { return playlist; } };
-    }
-    const ok = availableInPage.has(target);
-    return { ok, status: ok ? (options.headers?.Range ? 206 : 200) : 403, async text() { return ''; } };
-};
+    await run(env);
 
-const { VODUnmute } = require('./background.js');
+    assert.equal(env.updates.length, 1);
+    assert.equal(env.updates[0].addRules.length, 3);
+    assert.equal(env.updates[0].addRules[0].condition.urlFilter, `|${BASE}/${QUALITY}/1-muted.ts`);
+    assert.equal(env.updates[0].addRules[0].action.redirect.url, `${BASE}/${QUALITY}/1.ts`);
+    assert.deepEqual(env.updates[0].addRules[0].condition.tabIds, [1]);
 
-(async () => {
-    const manager = new VODUnmute();
-    await manager.process({ tabId: 5, url: playlistURL, epoch: manager.epoch(5) });
+    // Segments are probed with a two-byte range request, never downloaded.
+    const segmentFetches = env.fetches.filter((item) => item.url !== PLAYLIST);
+    assert.equal(segmentFetches.length, 3);
+    assert.equal(segmentFetches.every((item) => item.options.headers.Range === 'bytes=0-1'), true);
 
-    assert.equal(sessionRules.length, 2, 'one exact redirect rule per restorable segment');
-    const filters = sessionRules.map((rule) => rule.condition.urlFilter).sort();
-    assert.deepEqual(filters, [
-        `${vodBase}/720p60/0-muted.mp4`,
-        `${vodBase}/720p60/1-muted.mp4`
-    ]);
-    const targets = sessionRules.map((rule) => rule.action.redirect.url).sort();
-    assert.deepEqual(targets, [`${vodBase}/720p60/0.mp4`, `${vodBase}/720p60/1.mp4`]);
-    assert.deepEqual(sessionRules[0].condition.tabIds, [5]);
-
-    const stats = manager.statsFor(5);
+    const stats = env.unmute.statsFor(1);
     assert.equal(stats.state, 'ready');
-    assert.equal(stats.candidates, 2);
-    assert.equal(stats.unmuted, 2);
-    assert.equal(stats.muted, 1, 'segment without any unmuted original stays muted');
+    assert.equal(stats.unmuted, 3);
+    assert.equal(stats.lowerQuality, 0);
+    assert.equal(stats.muted, 0);
+    assert.equal(stats.quality, QUALITY);
 
-    const before = sessionRules.length;
-    await manager.process({ tabId: 5, url: playlistURL, epoch: manager.epoch(5) });
-    assert.equal(sessionRules.length, before, 'unchanged playlist must not duplicate rules');
+    await env.unmute.clearAll();
+    assert.equal(env.rules.length, 0);
+});
 
-    await manager.cleanupTab(5);
-    assert.equal(sessionRules.length, 0);
-    assert.equal(manager.tabs.has(5), false);
+test('audio is taken from a lower rendition when the original is gone', async () => {
+    const env = createEnvironment({
+        playlists: { [PLAYLIST]: makePlaylist(['1-muted.ts']) },
+        statuses: {
+            [`${BASE}/${QUALITY}/1.ts`]: 404,
+            [`${BASE}/480p30/1.ts`]: 200
+        }
+    });
 
-    assert.ok(injections.length > 0, 'validation must run through page injection');
+    await run(env);
 
-    // Quality tracking: once the player reveals its rendition, other renditions
-    // must be skipped instead of consuming probes.
-    manager.onSegmentRequest({ tabId: 5, url: `${vodBase}/720p60/7.mp4` });
-    assert.equal(manager.activeQuality.get(5), '720p60');
+    assert.equal(env.updates[0].addRules[0].action.redirect.url, `${BASE}/480p30/1.ts`);
+    const stats = env.unmute.statsFor(1);
+    assert.equal(stats.lowerQuality, 1);
+    assert.equal(stats.unmuted, 0);
+});
 
-    const rulesBeforeOtherQuality = sessionRules.length;
-    await manager.process({ tabId: 5, url: `${vodBase}/160p30/index-muted-JW6XYZ.m3u8`, epoch: manager.epoch(5) });
-    assert.equal(sessionRules.length, rulesBeforeOtherQuality, 'inactive rendition must not install rules');
-    assert.match(manager.tabs.get(5).renditions.get('160p30').stats.message, /not the rendition in use/);
-    assert.equal(manager.tabs.get(5).renditions.get('160p30').playlistURL,
-        `${vodBase}/160p30/index-muted-JW6XYZ.m3u8`, 'skipped playlist URL is remembered for a later switch');
+test('an fMP4 init segment is redirected together with the media', async () => {
+    const env = createEnvironment({
+        playlists: { [PLAYLIST]: makePlaylist(['1-muted.m4s'], 'init-muted.mp4') },
+        statuses: {
+            [`${BASE}/${QUALITY}/1.m4s`]: 200,
+            [`${BASE}/${QUALITY}/init.mp4`]: 200
+        }
+    });
 
-    // Switching to that rendition must start processing it without a new Twitch request.
-    manager.onSegmentRequest({ tabId: 5, url: `${vodBase}/160p30/7.mp4` });
-    assert.equal(manager.activeQuality.get(5), '160p30');
-    assert.equal(manager.working, true, 'quality switch immediately processes the remembered playlist');
-    while (manager.working) await new Promise((resolve) => setTimeout(resolve, 5));
+    await run(env);
 
-    console.log('background.test.js: all tests passed');
-})().catch((error) => {
-    console.error(error);
-    process.exitCode = 1;
+    const redirects = env.updates[0].addRules.map((rule) => rule.action.redirect.url);
+    assert.deepEqual(redirects, [`${BASE}/${QUALITY}/init.mp4`, `${BASE}/${QUALITY}/1.m4s`]);
+});
+
+test('nothing is redirected when the muted init segment has no original', async () => {
+    const env = createEnvironment({
+        playlists: { [PLAYLIST]: makePlaylist(['1-muted.m4s'], 'init-muted.mp4') },
+        statuses: { [`${BASE}/${QUALITY}/1.m4s`]: 200 }
+    });
+
+    await run(env);
+
+    assert.equal(env.updates.length, 0);
+    assert.equal(env.unmute.statsFor(1).state, 'unavailable');
+});
+
+test('probe results are cached between playlist reloads', async () => {
+    const env = createEnvironment({
+        playlists: { [PLAYLIST]: makePlaylist(['1-muted.ts']) },
+        statuses: { [`${BASE}/${QUALITY}/1.ts`]: 200 }
+    });
+
+    await run(env);
+    const before = env.fetches.length;
+    env.unmute.tabs.get(1).renditions.get(QUALITY).signature = null;
+    await run(env);
+
+    // Only the playlist is downloaded again; the segment is not re-probed.
+    assert.equal(env.fetches.length, before + 1);
+});
+
+test('throttled probes are retried, missing files are not', async () => {
+    const env = createEnvironment({
+        settings: { quality: false },
+        playlists: { [PLAYLIST]: makePlaylist(['1-muted.ts', '2-muted.ts']) },
+        statuses: {
+            [`${BASE}/${QUALITY}/1.ts`]: [503, 200],
+            [`${BASE}/${QUALITY}/2.ts`]: 404
+        }
+    });
+
+    await run(env);
+
+    assert.equal(probes(env, `${BASE}/${QUALITY}/1.ts`), 2);
+    assert.equal(probes(env, `${BASE}/${QUALITY}/2.ts`), 1);
+    const stats = env.unmute.statsFor(1);
+    assert.equal(stats.unmuted, 1);
+    assert.equal(stats.muted, 1);
+});
+
+test('the Chrome session rule budget is respected and reported', async () => {
+    const segments = [];
+    const statuses = {};
+    for (let index = 1; index <= 20; index++) {
+        segments.push(`${index}-muted.ts`);
+        statuses[`${BASE}/${QUALITY}/${index}.ts`] = 200;
+    }
+    const existingRules = Array.from({ length: 4890 }, (unused, index) => ({
+        id: 100000 + index,
+        priority: 1,
+        action: { type: 'block' },
+        condition: { urlFilter: '|https://example.com/', tabIds: [2] }
+    }));
+
+    const env = createEnvironment({
+        playlists: { [PLAYLIST]: makePlaylist(segments) },
+        statuses,
+        existingRules
+    });
+
+    await run(env);
+
+    assert.equal(env.updates[0].addRules.length, 10);
+    const stats = env.unmute.statsFor(1);
+    assert.equal(stats.truncated, 10);
+    assert.match(stats.message, /Лимит правил Chrome/);
 });
