@@ -31,6 +31,7 @@ class VODUnmute {
         this.probeCache = new Map();      // candidate URL -> { status, at }
         this.tabPages = new Map();        // tabId -> page identity (VOD id)
         this.discoveredAt = new Map();    // tabId -> last timeline scan
+        this.probing = new Set();         // segment URLs the extension is checking right now
         this.queue = [];
         this.working = false;
         this.mutations = Promise.resolve();
@@ -256,6 +257,9 @@ class VODUnmute {
     // The rendition the player is really pulling is the one whose segments are
     // being requested, so segment traffic is watched instead of guessing.
     onSegmentRequest(details) {
+        // Our own checks hit the very same URLs, so without this guard the
+        // extension mistakes its probes for the player switching rendition.
+        if (this.probing.has(details.url)) return;
         const quality = details.url.split('/').at(-2);
         if (!quality || !QUALITY_DIR_PATTERN.test(quality)) return;
         if (!this.noteActiveQuality(details.tabId, quality)) return;
@@ -598,7 +602,14 @@ class VODUnmute {
 
         if (!pending.length) return statuses;
 
-        const fresh = await VODNet.probeInPage(tabId, pending);
+        const inFlight = pending.flat();
+        for (const url of inFlight) this.probing.add(url);
+        let fresh;
+        try {
+            fresh = await VODNet.probeInPage(tabId, pending);
+        } finally {
+            for (const url of inFlight) this.probing.delete(url);
+        }
         if (fresh === null) return null;
         fresh.forEach((group, position) => {
             const index = owners[position];

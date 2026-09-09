@@ -357,3 +357,21 @@ test('the Chrome session rule budget is respected and reported', async () => {
     assert.equal(stats.truncated, 10);
     assert.match(stats.message, /Лимит правил Chrome/);
 });
+
+test('the extension does not mistake its own probes for the player', async () => {
+    const env = createEnvironment({
+        playlists: { [PLAYLIST]: makePlaylist(['1-muted.ts']) },
+        statuses: { [`${BASE}/${QUALITY}/1.ts`]: 200 }
+    });
+
+    const probed = `${BASE}/${QUALITY}/9.mp4`;
+    env.unmute.probing.add(probed);
+    env.listeners.request({ tabId: 1, url: probed });
+
+    // A URL the extension is checking itself is not player traffic.
+    assert.deepEqual(env.unmute.activeQualitiesFor(1), []);
+
+    env.unmute.probing.delete(probed);
+    env.listeners.request({ tabId: 1, url: probed });
+    assert.deepEqual(env.unmute.activeQualitiesFor(1), [QUALITY]);
+});
