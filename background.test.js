@@ -128,10 +128,10 @@ test('muted segments become exact redirect rules', async () => {
     assert.equal(env.updates[0].addRules[0].action.redirect.url, `${BASE}/${QUALITY}/1.ts`);
     assert.deepEqual(env.updates[0].addRules[0].condition.tabIds, [1]);
 
-    // Segments are probed with a two-byte range request, never downloaded.
+    // Segments are probed with a plain GET that is aborted before the body arrives.
     const segmentFetches = env.fetches.filter((item) => item.url !== PLAYLIST);
     assert.equal(segmentFetches.length, 3);
-    assert.equal(segmentFetches.every((item) => item.options.headers.Range === 'bytes=0-1'), true);
+    assert.equal(segmentFetches.every((item) => !item.options.headers), true);
 
     const stats = env.unmute.statsFor(1);
     assert.equal(stats.state, 'ready');

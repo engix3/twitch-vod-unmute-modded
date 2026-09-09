@@ -17,5 +17,5 @@
    "minimum_chrome_version": "102",
    "name": "Twitch VOD Unmute — Modded",
    "permissions": [ "declarativeNetRequest", "webRequest", "storage", "scripting", "tabs" ],
-   "version": "1.8.0"
+   "version": "1.8.1"
 }
