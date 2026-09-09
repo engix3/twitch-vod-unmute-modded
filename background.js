@@ -11,13 +11,19 @@ const QUALITY_DIR_PATTERN = /^(?:chunked|audio_only|\d{3,4}p\d{2})$/;
 const BATCH_SIZE = 6;
 const PROBE_TTL_MS = 10 * 60 * 1000;
 const PROBE_CACHE_LIMIT = 20000;
+// Adaptive streaming keeps several renditions warm, so a quality counts as
+// playing while its segments were requested recently.
+const ACTIVE_TTL_MS = 60 * 1000;
+// Twitch re-requests the same media playlist over and over; a rendition with a
+// verdict is not downloaded again until this window passes.
+const RECHECK_AFTER_MS = 30 * 1000;
 const HIT_STATUSES = new Set([200, 206]);
 
 class VODUnmute {
     constructor() {
         this.tabs = new Map();            // tabId -> { vodBase, renditions: Map<quality, rendition> }
         this.epochs = new Map();          // tabId -> invalidation counter
-        this.activeQuality = new Map();   // tabId -> quality the player is really requesting
+        this.activeQualities = new Map(); // tabId -> Map<quality, last segment request>
         this.knownPlaylists = new Map();  // tabId -> Set<playlistURL>
         this.paintData = new Map();       // tabId -> { ranges, totalDuration }
         this.probeCache = new Map();      // candidate URL -> { status, at }
@@ -111,9 +117,9 @@ class VODUnmute {
         if (!entry || !entry.renditions.size) return this.emptyStats();
         // The rendition the player is using wins, then an in-progress check:
         // otherwise a finished rendition hides the one being watched.
-        const active = this.activeQuality.get(tabId);
+        const active = this.activeQualitiesFor(tabId);
         const rank = (rendition) => {
-            if (rendition.quality === active && rendition.stats.state !== 'waiting') return 4;
+            if (active.includes(rendition.quality) && rendition.stats.state !== 'waiting') return 4;
             if (rendition.stats.state === 'processing') return 3;
             if (rendition.ruleIds.length) return 2;
             if (rendition.stats.muted || rendition.stats.candidates) return 1;
@@ -129,7 +135,7 @@ class VODUnmute {
             this.tabs.set(tabId, entry);
         }
         if (!entry.renditions.has(quality)) {
-            entry.renditions.set(quality, { quality, ruleIds: [], signature: null, stats: this.emptyStats(), playlistURL: undefined, updatedAt: Date.now() });
+            entry.renditions.set(quality, { quality, ruleIds: [], signature: null, checkedAt: 0, stats: this.emptyStats(), playlistURL: undefined, updatedAt: Date.now() });
         }
         return entry.renditions.get(quality);
     }
@@ -165,34 +171,58 @@ class VODUnmute {
         if (!this.working) this.drain().catch((error) => console.warn('[VOD Unmute] Queue failed:', error));
     }
 
+    // Twitch juggles renditions while playing (ABR, preloading the next quality),
+    // so "active" is a small set with timestamps rather than a single value —
+    // otherwise every switch looked like a brand new rendition.
+    noteActiveQuality(tabId, quality) {
+        if (!this.activeQualities.has(tabId)) this.activeQualities.set(tabId, new Map());
+        const seen = this.activeQualities.get(tabId);
+        const isNew = !seen.has(quality);
+        seen.set(quality, Date.now());
+        return isNew;
+    }
+
+    activeQualitiesFor(tabId) {
+        const seen = this.activeQualities.get(tabId);
+        if (!seen) return [];
+        const cutoff = Date.now() - ACTIVE_TTL_MS;
+        for (const [quality, at] of [...seen]) if (at < cutoff) seen.delete(quality);
+        return [...seen.keys()];
+    }
+
+    isActiveQuality(tabId, quality) {
+        const active = this.activeQualitiesFor(tabId);
+        return !active.length || active.includes(quality);
+    }
+
     // The rendition the player is really pulling is the one whose segments are
     // being requested, so segment traffic is watched instead of guessing.
     onSegmentRequest(details) {
         const quality = details.url.split('/').at(-2);
         if (!quality || !QUALITY_DIR_PATTERN.test(quality)) return;
-        if (this.activeQuality.get(details.tabId) === quality) return;
-        this.activeQuality.set(details.tabId, quality);
+        if (!this.noteActiveQuality(details.tabId, quality)) return;
         console.log(`[VOD Unmute] Player is using ${quality}.`);
         this.sortQueue(details.tabId);
-        // Switching quality mid-playback must trigger a check for the new one,
-        // because its playlist was already fetched and will not repeat.
+        // A quality that started playing later still needs its check, because
+        // its playlist was already fetched and will not be requested again.
         this.requeueActive(details.tabId, quality);
     }
 
+    // Only renditions without a verdict are re-queued; one that was already
+    // checked must not be probed again on every quality switch.
     requeueActive(tabId, quality) {
         const rendition = this.tabs.get(tabId)?.renditions.get(quality);
-        if (!rendition || rendition.ruleIds.length || rendition.playlistURL === undefined) return;
-        rendition.signature = null;
+        if (!rendition || rendition.signature !== null || rendition.playlistURL === undefined) return;
         this.enqueue(tabId, rendition.playlistURL);
     }
 
     // Check the rendition being watched first: a background rendition must never
     // delay the quality the user actually sees.
     sortQueue(tabId) {
-        const active = this.activeQuality.get(tabId);
-        if (!active) return;
+        const active = this.activeQualitiesFor(tabId);
+        if (!active.length) return;
         this.queue.sort((a, b) => {
-            const score = (item) => (item.tabId === tabId && item.url.split('/').at(-2) === active ? 0 : 1);
+            const score = (item) => (item.tabId === tabId && active.includes(item.url.split('/').at(-2)) ? 0 : 1);
             return score(a) - score(b);
         });
     }
@@ -200,7 +230,12 @@ class VODUnmute {
     async reprocessKnown() {
         for (const [tabId, urls] of this.knownPlaylists) {
             const entry = this.tabs.get(tabId);
-            if (entry) for (const rendition of entry.renditions.values()) rendition.signature = null;
+            if (entry) {
+                for (const rendition of entry.renditions.values()) {
+                    rendition.signature = null;
+                    rendition.checkedAt = 0;
+                }
+            }
             for (const url of urls) this.enqueue(tabId, url);
         }
     }
@@ -243,14 +278,19 @@ class VODUnmute {
         this.remember(tabId, url);
         // Remember where the playlist lives so a later quality switch can process
         // it without waiting for Twitch to request it again.
-        this.rendition(tabId, vodBase, quality).playlistURL = url;
+        const rendition = this.rendition(tabId, vodBase, quality);
+        rendition.playlistURL = url;
 
-        // Only spend probes on the rendition the player is actually pulling.
-        const active = this.activeQuality.get(tabId);
-        if (active && active !== quality) {
+        // The player asks for the same playlist every few seconds. Once the
+        // rendition has a verdict, it is not downloaded again for a while: this
+        // is what used to spin the whole check in a loop.
+        if (rendition.signature !== null && Date.now() - rendition.checkedAt < RECHECK_AFTER_MS) return;
+
+        // Only spend probes on renditions the player is actually pulling.
+        if (!this.isActiveQuality(tabId, quality)) {
             this.setStats(tabId, vodBase, quality, {
                 state: 'waiting',
-                message: `${quality} сейчас не воспроизводится (играет ${active}) — пропущено.`
+                message: `${quality} сейчас не воспроизводится (играет ${this.activeQualitiesFor(tabId).join(', ')}) — пропущено.`
             });
             return;
         }
@@ -277,11 +317,19 @@ class VODUnmute {
         const maps = playlist.entries.filter((entry) => entry.isMap);
         const mutedMedia = this.dedupe(media.filter((entry) => VODHelpers.isMutedURL(entry.url)));
         const mutedMaps = this.dedupe(maps.filter((entry) => VODHelpers.isMutedURL(entry.url)));
-        console.log(`[VOD Unmute] ${quality}: ${media.length} segments, ${mutedMedia.length} muted, ${mutedMaps.length} muted init.`);
 
         const signature = `${mutedMedia.length}:${media.length}:${mutedMedia[0]?.url || ''}`;
-        const rendition = this.rendition(tabId, vodBase, quality);
-        if (rendition.signature === signature && rendition.ruleIds.length) return;
+        // The verdict is stored before probing, so an unchanged playlist is never
+        // processed twice — including the "nothing could be restored" verdict.
+        if (rendition.signature === signature) {
+            rendition.checkedAt = Date.now();
+            return;
+        }
+        rendition.signature = signature;
+        rendition.checkedAt = Date.now();
+        const giveUp = () => { rendition.signature = null; rendition.checkedAt = 0; };
+
+        console.log(`[VOD Unmute] ${quality}: ${media.length} segments, ${mutedMedia.length} muted, ${mutedMaps.length} muted init.`);
 
         if (!mutedMedia.length) {
             this.setStats(tabId, vodBase, quality, { ...this.emptyStats(), state: 'ready', message: `В ${quality} нет заглушённых сегментов.` });
@@ -306,18 +354,19 @@ class VODUnmute {
         const results = [];
         let checked = 0;
         for (let start = 0; start < mutedMedia.length; start += BATCH_SIZE) {
-            if (epoch !== this.epoch(tabId)) return;
+            if (epoch !== this.epoch(tabId)) { giveUp(); return; }
             const batch = mutedMedia.slice(start, start + BATCH_SIZE);
             const attempts = batch.map((entry) => this.candidatesFor(entry, quality, perSegmentLower));
             const responses = await this.probe(tabId, attempts.map((list) => list.map((item) => item.url)));
             if (responses === null) {
+                giveUp();
                 this.setStats(tabId, vodBase, quality, {
                     state: 'unavailable',
                     message: `${quality}: проверка остановлена на ${checked}/${mutedMedia.length}; перезагрузите страницу.`
                 });
                 return;
             }
-            if (epoch !== this.epoch(tabId)) return;
+            if (epoch !== this.epoch(tabId)) { giveUp(); return; }
 
             batch.forEach((entry, index) => {
                 const statuses = responses[index] || [];
@@ -358,6 +407,7 @@ class VODUnmute {
             return;
         }
 
+        rendition.checkedAt = Date.now();
         await VODRules.install(this, { tabId, vodBase, quality, signature, initRedirects, restored, epoch, stats });
         if (epoch !== this.epoch(tabId)) return;
         await this.paintSeekbar(tabId, results, quality, playlist.totalDuration);
@@ -395,13 +445,16 @@ class VODUnmute {
         const control = await this.probe(tabId, [[results[0].source]]);
         const controlStatus = control?.[0]?.[0];
         const codes = [...new Set(results.flatMap((item) => item.statuses))].join(', ') || 'нет';
+        const forbidden = results.every((item) => item.statuses.length && item.statuses.every((status) => status === 401 || status === 403));
         console.warn(`[VOD Unmute] ${quality}: no unmuted files. statuses=${codes}, muted control=${controlStatus}.`);
         this.setStats(tabId, vodBase, quality, {
             ...stats,
             state: 'unavailable',
-            message: HIT_STATUSES.has(controlStatus)
-                ? 'Twitch не хранит оригиналы без «-muted» для этой записи — звук вернуть нельзя.'
-                : `Проверка сегментов блокируется (контроль=${controlStatus}) — результат ненадёжен.`
+            message: !HIT_STATUSES.has(controlStatus)
+                ? `Проверка сегментов блокируется (контроль=${controlStatus}) — результат ненадёжен.`
+                : forbidden
+                    ? 'CDN отвечает 403 на файлы без «-muted»: оригиналы этой записи уже удалены — звук вернуть нельзя.'
+                    : 'Twitch не хранит оригиналы без «-muted» для этой записи — звук вернуть нельзя.'
         });
     }
 
@@ -438,9 +491,11 @@ class VODUnmute {
     }
 
     rememberStatus(url, status) {
-        // Only definitive answers are cached: a throttled or failed request must
-        // be retried later instead of poisoning the result.
-        if (!HIT_STATUSES.has(status) && status !== 404 && status !== 410) return;
+        // Only definitive answers are cached (including 403, which is how the
+        // CDN says "no such object"): a throttled or failed request must be
+        // retried later instead of poisoning the result.
+        const verdict = VODHelpers.classifyValidation(status);
+        if (!verdict.valid && !verdict.definitive) return;
         if (this.probeCache.size >= PROBE_CACHE_LIMIT) this.probeCache.clear();
         this.probeCache.set(url, { status, at: Date.now() });
     }
@@ -493,7 +548,7 @@ class VODUnmute {
         this.queue = this.queue.filter((item) => item.tabId !== tabId);
         // Stale per-tab state used to survive navigation and make the next VOD
         // skip its only rendition.
-        this.activeQuality.delete(tabId);
+        this.activeQualities.delete(tabId);
         this.knownPlaylists.delete(tabId);
         this.paintData.delete(tabId);
         await this.serialize(async () => {
@@ -517,7 +572,7 @@ class VODUnmute {
     async clearAll() {
         for (const tabId of [...this.tabs.keys(), ...this.epochs.keys()]) this.bump(tabId);
         this.queue = [];
-        this.activeQuality.clear();
+        this.activeQualities.clear();
         const painted = [...this.paintData.keys()];
         this.paintData.clear();
         await this.serialize(async () => {
