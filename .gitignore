@@ -1,0 +1,28 @@
+# Зависимости
+node_modules/
+
+# Сборки и архивы расширения
+dist/
+build/
+*.zip
+*.crx
+*.pem
+
+# Логи
+*.log
+npm-debug.log*
+
+# Локальные настройки редакторов и ОС
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Локальные окружения
+.env
+.env.local
+
+# Экспорт настроек из popup
+twitch-vod-unmute-settings.json
