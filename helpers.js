@@ -3,6 +3,11 @@
     if (typeof module === 'object' && module.exports) module.exports = helpers;
     root.VODHelpers = helpers;
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+    // `-muted` is a marker only when it closes the file name, right before the
+    // extension or at the very end: `1-muted.ts` is muted, `1-mutedmix.ts` is a
+    // different file that must never be rewritten.
+    const MUTED_MARKER = /-muted(?=\.[^.]*$|$)/;
+
     function isAllowedMediaURL(value) {
         try {
             const hostname = new URL(value).hostname.toLowerCase();
@@ -37,6 +42,9 @@
         return match ? (match[1] || match[2] || '').trim() : null;
     }
 
+    // Playlist lines may be relative (`1.ts`, `../720p60/1.ts`) or absolute, so
+    // every URI has to be resolved against the playlist URL instead of being
+    // glued to a base string.
     function resolveMediaURL(uri, playlistURL) {
         try {
             const url = new URL(uri, playlistURL).href;
@@ -88,15 +96,17 @@
     function unmuteURL(sourceURL) {
         const parsed = new URL(sourceURL);
         const parts = parsed.pathname.split('/');
-        parts[parts.length - 1] = parts[parts.length - 1].replace('-muted', '');
+        const filename = parts[parts.length - 1];
+        if (!MUTED_MARKER.test(filename)) return parsed.href;
+        parts[parts.length - 1] = filename.replace(MUTED_MARKER, '');
         parsed.pathname = parts.join('/');
         return parsed.href;
     }
 
     function isMutedURL(sourceURL) {
         try {
-            const filename = new URL(sourceURL).pathname.split('/').pop();
-            return filename.includes('-muted');
+            const filename = new URL(sourceURL).pathname.split('/').pop() || '';
+            return MUTED_MARKER.test(filename);
         } catch {
             return false;
         }
@@ -115,62 +125,8 @@
         return parsed.href;
     }
 
-    function exactURLRegex(url) {
-        return '^' + String(url).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$';
-    }
-
-    function asciiRegex(value, limit = 2000) {
-        return typeof value === 'string' && value.length <= limit && /^[\x00-\x7F]*$/.test(value);
-    }
-
-    function commonPrefix(values) {
-        if (!values.length) return '';
-        let prefix = values[0];
-        for (const value of values.slice(1)) {
-            let length = 0;
-            while (length < prefix.length && prefix[length] === value[length]) length++;
-            prefix = prefix.slice(0, length);
-        }
-        return prefix;
-    }
-
-    function createDnrRuleSpec(entries, candidates, requestedQuality, replacementQuality) {
-        if (!Array.isArray(entries) || !entries.length || entries.length !== candidates.length) return null;
-        const sources = entries.map((entry) => new URL(entry.url));
-        const targets = candidates.map((candidate) => new URL(candidate.url));
-        if (sources.some((url) => !isAllowedMediaURL(url.href)) || targets.some((url) => !isAllowedMediaURL(url.href))) return null;
-        if (sources.some((url) => url.protocol !== 'https:' || url.origin !== sources[0].origin)) return null;
-        if (targets.some((url) => url.protocol !== 'https:' || url.origin !== targets[0].origin)) return null;
-
-        const sourcePaths = sources.map((url) => url.pathname);
-        const escapedOrigin = String(sources[0].origin).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        let regex;
-        let substitution;
-        const sourceDirectories = sourcePaths.map((path) => path.slice(0, path.lastIndexOf('/') + 1));
-        const sourceDirectory = sourceDirectories[0];
-        if (sourceDirectories.some((directory) => directory !== sourceDirectory)) return null;
-        const targetDirectories = targets.map((url) => url.pathname.slice(0, url.pathname.lastIndexOf('/') + 1));
-        const targetDirectory = targetDirectories[0];
-        if (targetDirectories.some((directory) => directory !== targetDirectory)) return null;
-        if (!replacementQuality) {
-            if (targets.some((url, index) => url.origin !== sources[index].origin || url.pathname !== sourcePaths[index].replace(/-muted/, '') || url.search !== sources[index].search)) return null;
-            const escapedDirectory = sourceDirectory.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            regex = `^${escapedOrigin}${escapedDirectory}([^/?#]+)-muted([^/?#]*)(\\?.*)?$`;
-            substitution = `${sources[0].origin}${sourceDirectory}\\1\\2\\3`;
-        } else {
-            const qualityMarker = `/${requestedQuality}/`;
-            if (!sourceDirectory.endsWith(qualityMarker) || !targetDirectory.endsWith(`/${replacementQuality}/`)) return null;
-            if (targets.some((url, index) => url.origin !== sources[index].origin || url.pathname !== sourcePaths[index].replace(qualityMarker, `/${replacementQuality}/`).replace(/-muted/, '') || url.search !== sources[index].search)) return null;
-            const escapedDirectory = sourceDirectory.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            regex = `^${escapedOrigin}${escapedDirectory}([^/?#]+)-muted([^/?#]*)(\\?.*)?$`;
-            substitution = `${sources[0].origin}${targetDirectory}\\1\\2\\3`;
-        }
-        if (!asciiRegex(regex) || !asciiRegex(substitution)) return null;
-        const check = new RegExp(regex);
-        if (sources.some((url) => !check.test(url.href))) return null;
-        return { regexFilter: regex, regexSubstitution: substitution };
-    }
-
+    // Distinguishes "this file does not exist" from "the CDN is throttling us":
+    // a transient answer must be retried, a definitive one must not.
     function classifyValidation(status, contentType) {
         if (status === 404 || status === 410) return { valid: false, definitive: true, status };
         if (status === 429 || status >= 500) return { valid: false, transient: true, status };
@@ -181,23 +137,6 @@
         return valid
             ? { valid: true, status, contentType }
             : { valid: false, transient: true, status, contentType };
-    }
-
-    function targetKey(tabId, url) {
-        return `${tabId}\n${url}`;
-    }
-
-    function resolveTargetRule(targetIndex, tabId, url) {
-        if (tabId >= 0) {
-            const ids = targetIndex.get(targetKey(tabId, url));
-            return ids && ids.size === 1 ? ids.values().next().value : null;
-        }
-        const matches = new Set();
-        for (const [key, ids] of targetIndex) {
-            if (key.slice(key.indexOf('\n') + 1) !== url) continue;
-            for (const id of ids) matches.add(id);
-        }
-        return matches.size === 1 ? matches.values().next().value : null;
     }
 
     function calculateSeekbarSegments(results, totalDuration) {
@@ -225,16 +164,13 @@
     return {
         calculateSeekbarSegments,
         classifyValidation,
-        createDnrRuleSpec,
-        exactURLRegex,
         isAllowedMediaURL,
         isMutedURL,
         isTwitchURL,
         isTwitchVodURL,
         parseHlsPlaylist,
         replaceQualityComponent,
-        resolveTargetRule,
-        targetKey,
+        resolveMediaURL,
         unmuteURL
     };
 });
