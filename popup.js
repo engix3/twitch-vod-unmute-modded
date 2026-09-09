@@ -1,177 +1,126 @@
-class PopupController {
-    constructor() {
-        this.settings = {};
-        this.statsTimer = null;
-        this.init();
+const DEFAULTS = {
+    enabled: true,
+    seekbar: true,
+    quality: true,
+    unmutedColour: '#00FF00',
+    qualityColour: '#FFFF00',
+    opacity: 0.5
+};
+
+const STATE_LABELS = {
+    waiting: 'Ожидание',
+    queued: 'В очереди',
+    loading: 'Загрузка',
+    processing: 'Проверка',
+    candidate: 'Подбор',
+    ready: 'Готово',
+    unavailable: 'Недоступно'
+};
+
+const $ = (id) => document.getElementById(id);
+let statsTimer = null;
+let closed = false;
+
+const schedule = (delay) => {
+    if (closed) return;
+    clearTimeout(statsTimer);
+    statsTimer = setTimeout(refreshStats, delay);
+};
+
+async function refreshStats() {
+    if (closed) return;
+    let stats;
+    try {
+        stats = await chrome.runtime.sendMessage({ action: 'getStats' });
+    } catch {
+        stats = null;
+    }
+    if (closed) return;
+
+    if (!stats) {
+        $('vodStatus').textContent = 'Служебный процесс не отвечает — перезагрузите страницу.';
+        $('vodStatus').dataset.state = 'unavailable';
+        schedule(5000);
+        return;
     }
 
-    async init() {
-        await this.loadSettings();
-        this.setupEventListeners();
-        this.updateUI();
-        await this.loadStats();
-        this.statsTimer = window.setInterval(() => this.loadStats(), 1000);
-        window.addEventListener('unload', () => {
-            if (this.statsTimer) window.clearInterval(this.statsTimer);
-        }, { once: true });
-    }
+    const state = STATE_LABELS[stats.state] ? stats.state : 'waiting';
+    $('vodStatus').dataset.state = state;
+    $('vodStatus').textContent = `${STATE_LABELS[state]}: ${stats.message || ''}`.trim();
+    $('statUnmuted').textContent = stats.unmuted ?? 0;
+    $('statLower').textContent = stats.lowerQuality ?? 0;
+    $('statMuted').textContent = stats.muted ?? 0;
+    $('statQuality').textContent = stats.quality ? `Качество: ${stats.quality}` : 'Качество: не определено';
+    $('statsGrid').hidden = false;
 
-    async loadSettings() {
-        const defaults = {
-            enabled: true,
-            seekbar: true,
-            unmutedColour: '#00FF00',
-            qualityColour: '#FFFF00',
-            opacity: 0.5,
-            quality: true
-        };
-
-        const items = await chrome.storage.sync.get(Object.keys(defaults));
-        this.settings = { ...defaults, ...items };
-        this.settings.enabled = typeof this.settings.enabled === 'boolean' ? this.settings.enabled : defaults.enabled;
-        this.settings.seekbar = typeof this.settings.seekbar === 'boolean' ? this.settings.seekbar : defaults.seekbar;
-        this.settings.quality = typeof this.settings.quality === 'boolean' ? this.settings.quality : defaults.quality;
-        this.settings.unmutedColour = /^#[0-9a-f]{6}$/i.test(this.settings.unmutedColour)
-            ? this.settings.unmutedColour : defaults.unmutedColour;
-        this.settings.qualityColour = /^#[0-9a-f]{6}$/i.test(this.settings.qualityColour)
-            ? this.settings.qualityColour : defaults.qualityColour;
-        this.settings.opacity = Number.isFinite(this.settings.opacity)
-            ? Math.min(1, Math.max(0, this.settings.opacity)) : defaults.opacity;
-
-        const normalizedSettings = {};
-        for (const [key, value] of Object.entries(this.settings)) {
-            if (items[key] !== value) normalizedSettings[key] = value;
-        }
-        if (Object.keys(normalizedSettings).length > 0) {
-            await chrome.storage.sync.set(normalizedSettings);
-        }
-    }
-
-    setupEventListeners() {
-        this.bindToggle('extensionToggle', 'enabled');
-        this.bindToggle('seekbarToggle', 'seekbar', () => this.updateSeekbarSettingsState());
-        this.bindToggle('qualityToggle', 'quality');
-
-        ['unmutedColour', 'qualityColour'].forEach((id) => {
-            document.getElementById(id).addEventListener('change', (event) => {
-                this.saveSetting(id, event.target.value);
-            });
-        });
-
-        const opacitySlider = document.getElementById('opacity');
-        opacitySlider.addEventListener('input', (event) => {
-            const value = parseFloat(event.target.value);
-            document.getElementById('opacityValue').textContent = Math.round(value * 100) + '%';
-        });
-        opacitySlider.addEventListener('change', (event) => {
-            this.saveSetting('opacity', parseFloat(event.target.value));
-        });
-
-        document.getElementById('exportBtn').addEventListener('click', () => this.exportSettings());
-        document.getElementById('refreshBtn').addEventListener('click', () => this.refreshCurrentTab());
-    }
-
-    bindToggle(elementId, settingKey, callback) {
-        const element = document.getElementById(elementId);
-        element.addEventListener('click', async () => {
-            this.settings[settingKey] = !this.settings[settingKey];
-            await this.saveSetting(settingKey, this.settings[settingKey]);
-            this.updateToggleUI(elementId, this.settings[settingKey]);
-            if (callback) callback();
-        });
-    }
-
-    updateUI() {
-        this.updateToggleUI('extensionToggle', this.settings.enabled);
-        this.updateToggleUI('seekbarToggle', this.settings.seekbar);
-        this.updateToggleUI('qualityToggle', this.settings.quality);
-
-        document.getElementById('unmutedColour').value = this.settings.unmutedColour;
-        document.getElementById('qualityColour').value = this.settings.qualityColour;
-        document.getElementById('opacity').value = this.settings.opacity;
-        document.getElementById('opacityValue').textContent = Math.round(this.settings.opacity * 100) + '%';
-        this.updateSeekbarSettingsState();
-    }
-
-    updateSeekbarSettingsState() {
-        const colorSettings = document.getElementById('colorSettings');
-        colorSettings.setAttribute('aria-disabled', String(!this.settings.seekbar));
-        document.getElementById('unmutedColour').disabled = !this.settings.seekbar;
-        document.getElementById('qualityColour').disabled = !this.settings.seekbar;
-        document.getElementById('opacity').disabled = !this.settings.seekbar;
-    }
-
-    updateToggleUI(elementId, isActive) {
-        const toggle = document.getElementById(elementId + 'Switch') ||
-            document.getElementById(elementId).querySelector('.toggle');
-        if (toggle) toggle.classList.toggle('active', isActive);
-        document.getElementById(elementId).setAttribute('aria-checked', String(Boolean(isActive)));
-    }
-
-    async saveSetting(key, value) {
-        await chrome.storage.sync.set({ [key]: value });
-        this.settings[key] = value;
-    }
-
-    updateStatsUI(response) {
-        const state = response.state || 'waiting';
-        const message = response.message || 'Waiting for a Twitch VOD playlist…';
-        const status = document.getElementById('vodStatus');
-        const statsGrid = document.getElementById('statsGrid');
-        const isPending = ['waiting', 'queued', 'loading', 'processing', 'candidate'].includes(state);
-
-        status.className = `vod-status ${state}`;
-        status.textContent = message;
-        statsGrid.hidden = isPending;
-
-        if (!isPending) {
-            document.getElementById('statUnmuted').textContent = response.unmuted || 0;
-            document.getElementById('statLower').textContent = response.lowerQuality || 0;
-            document.getElementById('statMuted').textContent = response.muted || 0;
-        }
-    }
-
-    async loadStats() {
-        try {
-            const response = await chrome.runtime.sendMessage({ action: 'getStats' });
-            if (response) this.updateStatsUI(response);
-        } catch {
-            this.updateStatsUI({
-                state: 'waiting',
-                message: 'Connecting to the extension…'
-            });
-        }
-    }
-
-    exportSettings() {
-        const data = {
-            ...this.settings,
-            exportDate: new Date().toISOString(),
-            version: chrome.runtime.getManifest().version
-        };
-
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = 'twitch-vod-unmute-settings.json';
-        link.click();
-        URL.revokeObjectURL(url);
-    }
-
-    async refreshCurrentTab() {
-        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (tab && VODHelpers.isTwitchVodURL(tab.url)) {
-            chrome.tabs.reload(tab.id);
-            window.close();
-        } else {
-            const status = document.getElementById('vodStatus');
-            status.className = 'vod-status unavailable';
-            status.textContent = 'Please navigate to a Twitch VOD page first';
-        }
-    }
+    // Poll fast only while work is in progress; a finished VOD does not need a
+    // message every second.
+    const busy = state === 'processing' || state === 'loading' || state === 'queued' || state === 'candidate';
+    schedule(busy ? 1000 : 5000);
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-    new PopupController();
+async function loadSettings() {
+    const values = { ...DEFAULTS, ...(await chrome.storage.sync.get(Object.keys(DEFAULTS))) };
+    $('extensionToggle').checked = values.enabled === true;
+    $('seekbarToggle').checked = values.seekbar === true;
+    $('qualityToggle').checked = values.quality === true;
+    $('unmutedColour').value = values.unmutedColour;
+    $('qualityColour').value = values.qualityColour;
+    $('opacity').value = values.opacity;
+    $('opacityValue').textContent = `${Math.round(values.opacity * 100)}%`;
+    $('colorSettings').hidden = values.seekbar !== true;
+}
+
+function bindToggle(id, key, after) {
+    $(id).addEventListener('change', async (event) => {
+        await chrome.storage.sync.set({ [key]: event.target.checked });
+        after?.(event.target.checked);
+    });
+}
+
+async function exportSettings() {
+    const values = { ...DEFAULTS, ...(await chrome.storage.sync.get(Object.keys(DEFAULTS))) };
+    const blob = new Blob([JSON.stringify(values, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'twitch-vod-unmute-settings.json';
+    link.click();
+    // Revoking straight away can cancel the download in Chrome, so the URL is
+    // released on the next tick.
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+async function reloadVod() {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab?.id !== undefined) await chrome.tabs.reload(tab.id);
+    window.close();
+}
+
+document.addEventListener('DOMContentLoaded', async () => {
+    await loadSettings();
+
+    bindToggle('extensionToggle', 'enabled');
+    bindToggle('seekbarToggle', 'seekbar', (checked) => { $('colorSettings').hidden = !checked; });
+    bindToggle('qualityToggle', 'quality');
+
+    for (const [id, key] of [['unmutedColour', 'unmutedColour'], ['qualityColour', 'qualityColour']]) {
+        $(id).addEventListener('change', (event) => chrome.storage.sync.set({ [key]: event.target.value }));
+    }
+
+    $('opacity').addEventListener('input', (event) => {
+        $('opacityValue').textContent = `${Math.round(event.target.value * 100)}%`;
+    });
+    $('opacity').addEventListener('change', (event) => chrome.storage.sync.set({ opacity: Number(event.target.value) }));
+
+    $('exportBtn').addEventListener('click', () => exportSettings());
+    $('refreshBtn').addEventListener('click', () => reloadVod());
+
+    refreshStats();
+});
+
+// `unload` is unreliable for extension popups; `pagehide` always fires.
+window.addEventListener('pagehide', () => {
+    closed = true;
+    clearTimeout(statsTimer);
 });

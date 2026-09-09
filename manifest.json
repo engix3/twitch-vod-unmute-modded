@@ -6,7 +6,7 @@
    "background": {
       "service_worker": "background.js"
    },
-   "description": "Restores available Twitch VOD audio with lower-quality fallback, statistics, and a seekbar overlay.",
+   "description": "Возвращает звук в заглушённых участках записей Twitch: откат по качеству, статистика и подсветка на полосе прокрутки.",
    "host_permissions": [ "https://*.twitch.tv/*", "https://twitch.tv/*", "https://*.ttvnw.net/*", "https://*.cloudfront.net/*" ],
    "icons": {
       "128": "128.png",
@@ -17,5 +17,5 @@
    "minimum_chrome_version": "102",
    "name": "Twitch VOD Unmute — Modded",
    "permissions": [ "declarativeNetRequest", "webRequest", "storage", "scripting", "tabs" ],
-   "version": "1.7.0"
+   "version": "1.8.0"
 }
