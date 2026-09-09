@@ -88,7 +88,7 @@ class VODUnmute {
             const page = this.pageKey(change.url);
             const previous = this.tabPages.get(tabId);
             this.tabPages.set(tabId, page);
-            if (previous === page) return;
+            if (previous === undefined || previous === page) return;
             this.cleanupTab(tabId).catch(() => {});
             return;
         }
