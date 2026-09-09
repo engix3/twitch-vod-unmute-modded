@@ -5,6 +5,8 @@
     if (typeof module === 'object' && module.exports) module.exports = net;
     root.VODNet = net;
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+    const PLAYLIST_PATTERN = /index-muted-[A-Z0-9]+\.m3u8/i;
+
     async function fetchInPage(tabId, url) {
         try {
             const [result] = await chrome.scripting.executeScript({
@@ -24,6 +26,35 @@
         } catch (error) {
             console.debug('[VOD Unmute] executeScript failed:', error.message);
             return null;
+        }
+    }
+
+    // The playlist request happens once per rendition, so it is easy to miss:
+    // the service worker may have been asleep, the extension may have been
+    // enabled mid-playback, or the tab state may have been reset. The page
+    // itself remembers every file it downloaded, so the playlists are recovered
+    // from its resource timeline instead of waiting for a request that will
+    // never repeat.
+    async function discoverPlaylists(tabId) {
+        try {
+            const [result] = await chrome.scripting.executeScript({
+                target: { tabId },
+                args: [PLAYLIST_PATTERN.source],
+                func: (pattern) => {
+                    try {
+                        const test = new RegExp(pattern, 'i');
+                        return performance.getEntriesByType('resource')
+                            .map((entry) => entry.name)
+                            .filter((name) => test.test(name));
+                    } catch {
+                        return [];
+                    }
+                }
+            });
+            return result?.result ?? [];
+        } catch (error) {
+            console.debug('[VOD Unmute] Playlist discovery failed:', error.message);
+            return [];
         }
     }
 
@@ -84,5 +115,5 @@
         }
     }
 
-    return { fetchInPage, probeInPage };
+    return { PLAYLIST_PATTERN, discoverPlaylists, fetchInPage, probeInPage };
 });

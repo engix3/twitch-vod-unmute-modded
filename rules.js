@@ -63,9 +63,22 @@
             // Only this rendition's rules are replaced: other qualities of the
             // same VOD keep working.
             const ownIds = new Set(rendition.ruleIds);
-            const removeRuleIds = live.filter((rule) => ownIds.has(rule.id)).map((rule) => rule.id);
-            const foreign = live.filter((rule) => !ownIds.has(rule.id));
-            const used = new Set(foreign.map((rule) => rule.id));
+            // Session rules outlive the service worker, so a previous generation
+            // of it can leave rules for this very rendition behind. They are
+            // replaced instead of being duplicated.
+            const prefix = `|${vodBase}/${quality}/`;
+            const staleIds = new Set(live
+                .filter((rule) => !ownIds.has(rule.id) &&
+                    rule.condition?.tabIds?.includes(tabId) &&
+                    typeof rule.condition?.urlFilter === 'string' &&
+                    rule.condition.urlFilter.startsWith(prefix))
+                .map((rule) => rule.id));
+            const removeRuleIds = [
+                ...live.filter((rule) => ownIds.has(rule.id)).map((rule) => rule.id),
+                ...staleIds
+            ];
+            const foreign = live.filter((rule) => !ownIds.has(rule.id) && !staleIds.has(rule.id));
+            const used = new Set(live.map((rule) => rule.id));
             const budget = Math.max(0, Math.min(MAX_RULES_PER_RENDITION, limit() - foreign.length));
 
             if (budget <= initRedirects.length) {
@@ -89,6 +102,7 @@
                 console.warn('[VOD Unmute] Installing rules failed:', error);
                 rendition.ruleIds = [];
                 rendition.signature = null;
+                rendition.checkedAt = 0;
                 unmute.setStats(tabId, vodBase, quality, { ...stats, state: 'unavailable', message: `Не удалось установить правила: ${error.message}` });
                 return;
             }
@@ -102,6 +116,7 @@
 
             rendition.ruleIds = addRules.map((rule) => rule.id);
             rendition.signature = signature;
+            rendition.checkedAt = Date.now();
             rendition.updatedAt = Date.now();
             const installed = Math.max(0, addRules.length - initRedirects.length);
             const tail = truncated ? ` Лимит правил Chrome: ${truncated} сегментов пропущено.` : '';
