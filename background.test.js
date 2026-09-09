@@ -80,6 +80,11 @@ function createEnvironment({ playlists = {}, statuses = {}, settings = {}, exist
 
 const run = (env, epoch = 0) => env.unmute.process({ tabId: 1, url: PLAYLIST, epoch });
 const probes = (env, url) => env.fetches.filter((item) => item.url === url).length;
+const forget = (env) => {
+    const rendition = env.unmute.tabs.get(1).renditions.get(QUALITY);
+    rendition.signature = null;
+    rendition.checkedAt = 0;
+};
 
 test('muted segments become exact redirect rules', async () => {
     const env = createEnvironment({
@@ -167,30 +172,75 @@ test('probe results are cached between playlist reloads', async () => {
 
     await run(env);
     const before = env.fetches.length;
-    env.unmute.tabs.get(1).renditions.get(QUALITY).signature = null;
+    forget(env);
     await run(env);
 
     // Only the playlist is downloaded again; the segment is not re-probed.
     assert.equal(env.fetches.length, before + 1);
 });
 
-test('throttled probes are retried, missing files are not', async () => {
+test('an unchanged playlist is not processed again', async () => {
+    const env = createEnvironment({
+        playlists: { [PLAYLIST]: makePlaylist(['1-muted.ts']) },
+        statuses: { [`${BASE}/${QUALITY}/1.ts`]: 403 }
+    });
+
+    await run(env);
+    const before = env.fetches.length;
+    // The player keeps re-requesting the same playlist: the stored verdict has
+    // to stop the check instead of restarting it in a loop.
+    await run(env);
+    await run(env);
+    assert.equal(env.fetches.length, before);
+    assert.equal(env.updates.length, 0);
+
+    // After the cooldown the playlist is fetched again, but the verdict matches
+    // so no segment is probed a second time.
+    forget(env);
+    await run(env);
+    assert.equal(env.fetches.length, before + 1);
+});
+
+test('a forbidden answer is final and is reported as such', async () => {
     const env = createEnvironment({
         settings: { quality: false },
-        playlists: { [PLAYLIST]: makePlaylist(['1-muted.ts', '2-muted.ts']) },
+        playlists: { [PLAYLIST]: makePlaylist(['1-muted.ts']) },
         statuses: {
-            [`${BASE}/${QUALITY}/1.ts`]: [503, 200],
-            [`${BASE}/${QUALITY}/2.ts`]: 404
+            [`${BASE}/${QUALITY}/1.ts`]: 403,
+            [`${BASE}/${QUALITY}/1-muted.ts`]: 206
         }
     });
 
     await run(env);
 
-    assert.equal(probes(env, `${BASE}/${QUALITY}/1.ts`), 2);
-    assert.equal(probes(env, `${BASE}/${QUALITY}/2.ts`), 1);
+    // 403 means "the CDN does not serve this object", so it must not be retried.
+    assert.equal(probes(env, `${BASE}/${QUALITY}/1.ts`), 1);
     const stats = env.unmute.statsFor(1);
-    assert.equal(stats.unmuted, 1);
-    assert.equal(stats.muted, 1);
+    assert.equal(stats.state, 'unavailable');
+    assert.match(stats.message, /403/);
+});
+
+test('quality switching does not restart a finished check', async () => {
+    const env = createEnvironment({
+        playlists: { [PLAYLIST]: makePlaylist(['1-muted.ts']) },
+        statuses: { [`${BASE}/${QUALITY}/1.ts`]: 200 }
+    });
+
+    env.unmute.onSegmentRequest({ tabId: 1, url: `${BASE}/${QUALITY}/1-muted.ts` });
+    await run(env);
+    const before = env.fetches.length;
+
+    // Adaptive streaming flips between renditions; a rendition that already has
+    // a verdict must not be queued again on every flip.
+    env.unmute.onSegmentRequest({ tabId: 1, url: `${BASE}/360p30/1.ts` });
+    env.unmute.onSegmentRequest({ tabId: 1, url: `${BASE}/${QUALITY}/2.ts` });
+    assert.equal(env.unmute.queue.length, 0);
+
+    // Both renditions count as playing, so the watched one is still processed.
+    assert.equal(env.unmute.isActiveQuality(1, QUALITY), true);
+    assert.equal(env.unmute.isActiveQuality(1, '360p30'), true);
+    assert.equal(env.unmute.isActiveQuality(1, '160p30'), false);
+    assert.equal(env.fetches.length, before);
 });
 
 test('the Chrome session rule budget is respected and reported', async () => {
